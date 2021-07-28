@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""
+Run the WaveRNN main entrypoint.
+"""
+import wavernn
+
+if __name__ == "__main__":
+    wavernn.main()

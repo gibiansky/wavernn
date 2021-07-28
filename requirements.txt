@@ -1,0 +1,17 @@
+antlr4-python3-runtime==4.8
+appdirs==1.4.4
+black==21.7b0
+click==8.0.1
+greenlet==1.1.0
+importlib-metadata==4.6.1
+mypy-extensions==0.4.3
+omegaconf==2.1.0
+pathspec==0.9.0
+pynvim==0.4.3
+PyYAML==5.4.1
+regex==2021.7.6
+tomli==1.1.0
+torch==1.9.0
+typed-ast==1.4.3
+typing-extensions==3.10.0.0
+zipp==3.5.0
