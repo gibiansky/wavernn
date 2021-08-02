@@ -3,9 +3,16 @@ Main entrypoint for WaveRNN package.
 """
 import click
 
-@click.command()
+import wavernn.dataset
+
+# import wavernn.train
+
+
+@click.group()
 def main() -> None:
     """
     WaveRNN neural vocoder.
     """
-    print("WaveRNN!")
+
+
+main.add_command(wavernn.dataset.dataset)
