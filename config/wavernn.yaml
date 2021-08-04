@@ -1,0 +1,33 @@
+# Config for baseline WaveRNN.
+data:
+  path: ljspeech
+  clip_frames: 3
+  padding_frames: 6
+  batch_size: 64
+  mel:
+    sample_rate: 22050
+    n_fft: 1024
+    n_mels: 80
+    fmin: 0.0
+    fmax: 11025.0
+    hop_length: 256
+    win_length: 512
+    log_epsilon: 1.0e-3
+
+conditioner:
+  layers: 3
+  channels: 256
+  width: 5
+  normalization_shift: 5.0
+  normalization_scale: 5.0
+
+autoregressive:
+  gru_dimension: 512
+  hidden_dimension: 512
+
+output:
+  buckets: 256
+  mu: 255
+
+optimizer:
+  learning_rate: 2.0e-4

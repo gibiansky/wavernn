@@ -4,8 +4,7 @@ Main entrypoint for WaveRNN package.
 import click
 
 import wavernn.dataset
-
-# import wavernn.train
+import wavernn.train
 
 
 @click.group()
@@ -16,3 +15,4 @@ def main() -> None:
 
 
 main.add_command(wavernn.dataset.dataset)
+main.add_command(wavernn.train.train)
