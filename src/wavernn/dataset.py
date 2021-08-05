@@ -42,7 +42,7 @@ def download_ljspeech(destination: str) -> None:
     path = download(DATASETS[NAME_LJSPEECH], destination)
 
     print("Extracting dataset (this may take a while)...")
-    cmd("tar", "--directory", destination, "-xzf", path)
+    cmd("tar", "--directory", destination, "-xf", path)
 
     print("Removing compressed version...")
     os.unlink(path)
