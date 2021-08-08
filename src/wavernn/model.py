@@ -2,11 +2,13 @@
 WaveRNN model definition.
 """
 from dataclasses import dataclass
+from typing import Iterable, Iterator, Tuple, Optional
 
 from omegaconf import MISSING
+from torch import Tensor
+import numpy as np
 import pytorch_lightning as pl
 import torch
-from torch import Tensor
 
 from wavernn.dataset import DataConfig, AudioSample
 from wavernn.util import die_if
@@ -81,8 +83,20 @@ class Conditioner(torch.nn.Module):
 class AutoregressiveConfig:
     """Configuration for WaveRNN autoregressive network."""
 
+    # State dimension for the GRU.
     gru_dimension: int = MISSING
+
+    # Output dimension of the linear layer after the GRU.
     hidden_dimension: int = MISSING
+
+    # What fraction of the weights to keep after pruning.
+    prune_fraction: float = MISSING
+
+    # How many iterations to wait to start pruning.
+    prune_start: int = MISSING
+
+    # By which iteration should pruning finish?
+    prune_end: int = MISSING
 
 
 class AutoregressiveRNN(torch.nn.Module):
@@ -103,22 +117,44 @@ class AutoregressiveRNN(torch.nn.Module):
             num_layers=1,
             batch_first=True,
         )
-        self.post_gru: torch.nn.Module = torch.nn.Sequential(
-            torch.nn.Linear(config.gru_dimension, config.hidden_dimension),
-            torch.nn.ReLU(),
+        self.post_gru: torch.nn.Module = torch.nn.Linear(
+            config.gru_dimension, config.hidden_dimension
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self, x: Tensor, state: Optional[Tensor] = None
+    ) -> Tuple[Tensor, Tensor]:
         """Run the network.
 
         Args:
           x: Input tensor of shape [batch, timesteps, input_channels].
+          state: Optional initial state of GRU.
 
         Returns:
-          Network outputs of shape [batch, timesteps, hidden_dimension].
+          Tuple of tensors containing:
+            - Network outputs of shape [batch, timesteps, hidden_dimension].
+            - Final state of shape [batch, gru_dimension].
         """
-        x, _ = self.gru(x)
-        return self.post_gru(x)
+        x, state = self.gru(x, state)
+        assert state is not None
+        return torch.nn.functional.relu(self.post_gru(x)), state
+
+    def extract_weights(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """
+        Extract the weights from this layer.
+
+        Returns:
+          A tuple containing (gru weights_ih, gru weights_hh, gru bias_ih, gru
+          bias_hh, hidden weights, hidden bias).
+        """
+        return (  # type: ignore
+            self.gru.weight_ih_l0,
+            self.gru.weight_hh_l0,
+            self.gru.bias_ih_l0,
+            self.gru.bias_hh_l0,
+            self.post_gru.weight,
+            self.post_gru.bias,
+        )
 
 
 @dataclass
@@ -177,8 +213,24 @@ class DiscretizedMuLaw(torch.nn.Module):
             * torch.log1p(mu * torch.abs(waveform))
             / torch.log1p(mu)
         )
-        x_mu = ((x_mu + 1) / 2 * mu + 0.5).to(torch.int64)
+        x_mu = ((x_mu + 1) / 2 * (self.buckets - 1) + 0.5).to(torch.int64)
         return x_mu
+
+    def dequantize(self, waveform: Tensor) -> Tensor:
+        """Dequantize a waveform with mu-law encoding and quantization.
+
+        Args:
+          waveform: The int64 quantized waveform.
+
+        Returns:
+          A float32 tensor of the same shape was `waveform`.
+        """
+        if not waveform.is_floating_point():
+            waveform = waveform.to(torch.float)
+        mu = torch.tensor(self.mu, dtype=waveform.dtype)
+        x = (waveform / (self.buckets - 1)) * 2 - 1.0
+        x = torch.sign(x) * (torch.exp(torch.abs(x) * torch.log1p(mu)) - 1.0) / mu
+        return x
 
     def embed(self, waveform: Tensor) -> Tensor:
         """
@@ -191,6 +243,20 @@ class DiscretizedMuLaw(torch.nn.Module):
           Embedding of shape [batch, num_samples, embedding_channels].
         """
         return self.embedding(self.quantize(waveform))
+
+    def sample(self, hidden: Tensor) -> Tensor:
+        """
+        Sample from this domain.
+
+        Args:
+          hidden: Output of the autoregressive layer of shape.
+
+        Returns:
+          Sample of shape [1].
+        """
+        logits = self.linear(hidden)
+        distribution = torch.nn.functional.softmax(logits)
+        return torch.multinomial(distribution, num_samples=1)
 
     def loss(self, hidden: Tensor, target: Tensor) -> Tensor:
         """
@@ -332,6 +398,102 @@ class Model(pl.LightningModule):
         # Run the autoregressive chunk of the network.
         hidden = self.upsample(hidden).transpose(1, 2)
         hidden += self.domain.embed(batch.waveform)
-        predictions = self.autoregressive(hidden)
+        predictions, _ = self.autoregressive(hidden)
 
         return self.domain.loss(predictions[:, :-1, :], batch.waveform[:, 1:])
+
+    def pytorch_inference(
+        self, conditioning: Tensor, prev_sample: Tensor, init_state: Tensor
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Run slow autoregressive inference implemented in Python.
+
+        Args:
+          conditioning: The conditioning information of shape [num_frames, channels].
+          prev_sample: A tensor of shape [1] containing the last generated sample.
+          init_state: A tensor of shape [gru_dimension] containing the last state.
+
+        Returns:
+          A tuple of tensors containing:
+            - the output samples
+            - the final generated sample
+            - the final GRU state
+        """
+        hop_length = self.config.data.mel.hop_length
+        num_frames = conditioning.size(0)
+        num_samples = hop_length * num_frames
+        outputs = torch.zeros((num_samples,), dtype=torch.int64)
+        state = init_state[None, None, :]
+        for timestep in range(num_samples):
+            frame_idx = timestep // hop_length
+            gru_input = conditioning[
+                frame_idx : frame_idx + 1, :
+            ] + self.domain.embedding(prev_sample)
+            hidden, state = self.autoregressive(gru_input.unsqueeze(0), state=state)
+            prev_sample = self.domain.sample(hidden.flatten())
+            outputs[timestep] = prev_sample[0]
+        return outputs, prev_sample, state.flatten()
+
+    @torch.no_grad()
+    def infer(
+        self, spectrograms: Iterable[np.ndarray], native: bool = True
+    ) -> Iterator[np.ndarray]:
+        """Run inference to generate audio.
+
+        Args:
+          spectrograms: An iterable of spectrograms. These should be
+              overlapping appropriately so that running through the conditioner
+              yields non-overlapping chunks that cover the input sequence. The
+              easiest way to get this is to load an AudioDataset (as if training)
+              and extract the samples that way.
+          native: Whether to use native inference (C++) or Pytorch inference (Python).
+
+        Yields:
+          Generated audio samples, one per input spectrogram. Output arrays
+          are of shape [num_samples] and are float32 in the range [-1, 1].
+        """
+        # Ensure the C++ library is loaded.
+        torch.ops.load_library("build/lib.linux-x86_64-3.9/wavernn_kernel.so")
+
+        # Extract hyperparameters and weights from the model.
+        hop_length = self.config.data.mel.hop_length
+        sample_embeddings = self.domain.embedding.weight
+        output_weights = self.domain.linear.weight
+        output_bias = self.domain.linear.bias
+        (
+            gru_weights_ih,
+            gru_weights_hh,
+            gru_bias_ih,
+            gru_bias_hh,
+            hidden_weights,
+            hidden_bias,
+        ) = self.autoregressive.extract_weights()
+
+        final_sample = torch.full((1,), 128, dtype=torch.int64)
+        final_state = torch.zeros((self.config.autoregressive.gru_dimension))
+
+        for spectrogram in spectrograms:
+            torch_spectrogram = torch.from_numpy(spectrogram).unsqueeze(0)
+            hidden = self.conditioner(torch_spectrogram)
+            conditioning = hidden.squeeze(0).transpose(0, 1)
+            if native:
+                samples = torch.ops.wavernn.wavernn_inference(
+                    conditioning,
+                    final_sample,
+                    final_state,
+                    sample_embeddings,
+                    gru_weights_ih,
+                    gru_weights_hh,
+                    gru_bias_ih,
+                    gru_bias_hh,
+                    hidden_weights,
+                    hidden_bias,
+                    output_weights,
+                    output_bias,
+                    hop_length,
+                )
+            else:
+                samples, final_sample, final_state = self.pytorch_inference(
+                    conditioning, final_sample, final_state
+                )
+            yield self.domain.dequantize(samples).numpy()

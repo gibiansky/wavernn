@@ -150,16 +150,23 @@ class AudioDataset(torch.utils.data.IterableDataset):
         for filename in filenames:
             yield from self.load_samples_from(filename)
 
-    def load_samples_from(self, filename: str) -> Iterator[AudioSample]:
+    def load_samples_from(
+        self, filename: str, clip_frames: Optional[int] = None
+    ) -> Iterator[AudioSample]:
         """
         Load training samples from a file.
 
         Args:
           filename: Path to load from.
+          clip_frames: How many spectrogram frames to include in each clip.
+            If not provided, uses the default in the data configuration.
 
         Yields:
           All the training samples from a given file.
         """
+        if clip_frames is None:
+            clip_frames = self.config.clip_frames
+
         # Load waveform from disk.
         mel = self.config.mel
 
@@ -202,7 +209,7 @@ class AudioDataset(torch.utils.data.IterableDataset):
             fmin=mel.fmin,
             fmax=mel.fmax,
         )
-        clip_frames = self.config.clip_frames
+        log_epsilon = torch.tensor(mel.log_epsilon, dtype=torch.float32)
         for i in range(0, spectrogram.shape[1], clip_frames):
             desired_frames = clip_frames + 2 * padding_frames
             clip_spectrogram = spectrogram[:, i : i + desired_frames]
@@ -212,7 +219,8 @@ class AudioDataset(torch.utils.data.IterableDataset):
             start_sample = (i + padding_frames) * mel.hop_length
             end_sample = start_sample + clip_frames * mel.hop_length
             clip_waveform = padded_waveform[start_sample:end_sample]
-            yield AudioSample(waveform=clip_waveform, spectrogram=clip_spectrogram)
+            log_spectrogram = torch.log(torch.maximum(clip_spectrogram, log_epsilon))
+            yield AudioSample(waveform=clip_waveform, spectrogram=log_spectrogram)
 
 
 class AudioDataModule(pl.LightningDataModule):

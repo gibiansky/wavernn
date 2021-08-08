@@ -1,4 +1,8 @@
-import setuptools
+"""
+setup.py for WaveRNN package.
+"""
+import setuptools  # type: ignore
+from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -24,4 +28,12 @@ setuptools.setup(
     packages=setuptools.find_packages(where="src"),
     python_requires=">=3.6",
     scripts=["scripts/wavernn"],
+    ext_modules=[
+        CppExtension(
+            "wavernn_kernel",
+            ["src/kernel/kernel.cpp"],
+            libraries=[],
+        )
+    ],
+    cmdclass={"build_ext": BuildExtension.with_options(no_python_abi_suffix=True)},
 )

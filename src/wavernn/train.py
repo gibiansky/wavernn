@@ -5,8 +5,9 @@ import os
 from typing import Optional
 import shutil
 
-import click
 from omegaconf import OmegaConf
+from pytorch_lightning.loggers import TensorBoardLogger
+import click
 import pytorch_lightning as pl
 
 
@@ -32,7 +33,7 @@ BEST_CHECKPOINT: str = "best"
     "--path", required=True, type=click.Path(file_okay=False), help="Model directory"
 )
 @click.option(
-    "--test-every", default=10, help="How often to run validation during training"
+    "--test-every", default=5000, help="How often to run validation during training"
 )
 def train(  # pylint: disable=missing-param-doc
     config: Optional[str], path: str, test_every: int
@@ -70,10 +71,12 @@ def train(  # pylint: disable=missing-param-doc
     )
     best_path = os.path.join(path, CHECKPOINTS_DIR, BEST_CHECKPOINT + ".ckpt")
     resume_from_checkpoint = best_path if os.path.exists(best_path) else None
+    logger = TensorBoardLogger(save_dir=path, version="logs")
     trainer = pl.Trainer(
         callbacks=[checkpoint_callback],
         resume_from_checkpoint=resume_from_checkpoint,
         val_check_interval=test_every,
+        logger=logger,
         gpus=1,
     )
     trainer.fit(model, data_module)

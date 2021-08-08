@@ -24,6 +24,9 @@ conditioner:
 autoregressive:
   gru_dimension: 512
   hidden_dimension: 512
+  prune_fraction: 0.0
+  prune_start: 100000
+  prune_end: 1000000
 
 output:
   buckets: 256
