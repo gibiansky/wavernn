@@ -2,7 +2,7 @@
 WaveRNN model definition.
 """
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Tuple, Optional
+from typing import Iterable, Iterator, Tuple, Optional, Any
 
 from omegaconf import MISSING
 from torch import Tensor
@@ -12,6 +12,7 @@ import torch
 
 from wavernn.dataset import DataConfig, AudioSample
 from wavernn.util import die_if
+from wavernn.prune import PruneConfig, prune
 
 # Key under which to log validation loss.
 VALIDATION_LOSS_KEY: str = "validation_loss"
@@ -88,15 +89,6 @@ class AutoregressiveConfig:
 
     # Output dimension of the linear layer after the GRU.
     hidden_dimension: int = MISSING
-
-    # What fraction of the weights to keep after pruning.
-    prune_fraction: float = MISSING
-
-    # How many iterations to wait to start pruning.
-    prune_start: int = MISSING
-
-    # By which iteration should pruning finish?
-    prune_end: int = MISSING
 
 
 class AutoregressiveRNN(torch.nn.Module):
@@ -297,6 +289,7 @@ class Config:
     autoregressive: AutoregressiveConfig = MISSING
     output: OutputConfig = MISSING
     optimizer: OptimizerConfig = MISSING
+    prune: PruneConfig = MISSING
 
 
 class Model(pl.LightningModule):
@@ -371,6 +364,46 @@ class Model(pl.LightningModule):
         self.log(VALIDATION_LOSS_KEY, loss)
         return loss
 
+    @torch.no_grad()
+    def on_train_batch_end(self, *args: Any) -> None:  # pylint: disable=unused-argument
+        """
+        Called after each training batch.
+
+        Used to perform pruning.
+
+        Args:
+          args: Unused arguments we don't need.
+        """
+        output_weights: Tensor = self.domain.linear.weight  # type: ignore
+        (
+            gru_weights_ih,
+            gru_weights_hh,
+            _gru_bias_ih,
+            _gru_bias_hh,
+            hidden_weights,
+            _hidden_bias,
+        ) = self.autoregressive.extract_weights()
+        sparse_matrices = [
+            output_weights,
+            gru_weights_ih,
+            gru_weights_hh,
+            hidden_weights,
+        ]
+        prune(
+            config=self.config.prune,
+            parameters=sparse_matrices,
+            step=self.global_step,
+        )
+
+        # Log sparsity fraction occasionally.
+        if self.global_step % 100 == 0:
+            nonzero_params = torch.tensor(0.0)
+            total_params = torch.tensor(0.0)
+            for matrix in sparse_matrices:
+                total_params += matrix.numel()
+                nonzero_params += torch.sum(matrix.abs() > 0.0).cpu()
+            self.log("remaining_fraction", nonzero_params / total_params)
+
     def loss(self, batch: AudioSample) -> Tensor:
         """
         Compute loss for one training or validation step.
@@ -436,7 +469,7 @@ class Model(pl.LightningModule):
 
     @torch.no_grad()
     def infer(
-        self, spectrograms: Iterable[np.ndarray], native: bool = True
+        self, spectrograms: Iterable[Tensor], native: bool = True
     ) -> Iterator[np.ndarray]:
         """Run inference to generate audio.
 
@@ -457,7 +490,7 @@ class Model(pl.LightningModule):
 
         # Extract hyperparameters and weights from the model.
         hop_length = self.config.data.mel.hop_length
-        sample_embeddings = self.domain.embedding.weight
+        sample_embeddings: Tensor = self.domain.embedding.weight # type: ignore
         output_weights = self.domain.linear.weight
         output_bias = self.domain.linear.bias
         (
@@ -472,19 +505,20 @@ class Model(pl.LightningModule):
         final_sample = torch.full((1,), 128, dtype=torch.int64)
         final_state = torch.zeros((self.config.autoregressive.gru_dimension))
 
+        sample_activations = torch.mm(sample_embeddings, gru_weights_ih.t())
         for spectrogram in spectrograms:
-            torch_spectrogram = torch.from_numpy(spectrogram).unsqueeze(0)
-            hidden = self.conditioner(torch_spectrogram)
+            hidden = self.conditioner(spectrogram.unsqueeze(0))
             conditioning = hidden.squeeze(0).transpose(0, 1)
             if native:
+                activations_ih = torch.addmm(
+                    gru_bias_ih, conditioning, gru_weights_ih.t()
+                )
                 samples = torch.ops.wavernn.wavernn_inference(
-                    conditioning,
+                    activations_ih,
                     final_sample,
                     final_state,
-                    sample_embeddings,
-                    gru_weights_ih,
+                    sample_activations,
                     gru_weights_hh,
-                    gru_bias_ih,
                     gru_bias_hh,
                     hidden_weights,
                     hidden_bias,

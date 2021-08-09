@@ -13,6 +13,7 @@ data:
     hop_length: 256
     win_length: 512
     log_epsilon: 1.0e-3
+    pre_emphasis: 0.97
 
 conditioner:
   layers: 3
@@ -24,9 +25,12 @@ conditioner:
 autoregressive:
   gru_dimension: 512
   hidden_dimension: 512
-  prune_fraction: 0.0
-  prune_start: 100000
-  prune_end: 1000000
+
+prune:
+  final_sparsity: 0.9
+  start_iteration: 100000
+  stop_iteration: 500000
+  block: [8, 8]
 
 output:
   buckets: 256

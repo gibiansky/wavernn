@@ -21,11 +21,11 @@ void gru_nonlinearity(Tensor &gru_state, const Tensor &gru_activations_ih,
 
 Tensor wavernn_inference(
     /* WaveRNN inputs */
-    const Tensor &conditioning, Tensor &previous_sample, Tensor &gru_state,
+    const Tensor &gru_activations_ih, Tensor &previous_sample, Tensor &gru_state,
 
     /* WaveRNN weights */
-    const Tensor &sample_embeddings, const Tensor &gru_weights_ih,
-    const Tensor &gru_weights_hh, const Tensor &gru_bias_ih,
+    const Tensor &sample_embeddings,
+    const Tensor &gru_weights_hh,
     const Tensor &gru_bias_hh, const Tensor &hidden_weights,
     const Tensor &hidden_bias, const Tensor &output_weights,
     const Tensor &output_bias,
@@ -35,23 +35,19 @@ Tensor wavernn_inference(
   c10::InferenceMode inferenceMode;
 
   // Extract hyperparameters.
-  auto num_frames = conditioning.size(0);
-  auto gru_input_size = conditioning.size(1);
+  auto num_frames = gru_activations_ih.size(0);
   auto gru_state_size = gru_state.size(0);
   auto hidden_size = hidden_bias.size(0);
   auto output_size = output_bias.size(0);
 
   // Verify sizes.
-  CHECK((conditioning.sizes() == c10::IntArrayRef{num_frames, gru_input_size}));
+  CHECK((gru_activations_ih.sizes() == c10::IntArrayRef{num_frames, 3 * gru_state_size}));
   CHECK((previous_sample.sizes() == c10::IntArrayRef{1}));
   CHECK((gru_state.sizes() == c10::IntArrayRef{gru_state_size}));
   CHECK((sample_embeddings.sizes() ==
-         c10::IntArrayRef{output_size, gru_input_size}));
-  CHECK((gru_weights_ih.sizes() ==
-         c10::IntArrayRef{3 * gru_state_size, gru_input_size}));
+         c10::IntArrayRef{output_size, 3 * gru_state_size}));
   CHECK((gru_weights_hh.sizes() ==
          c10::IntArrayRef{3 * gru_state_size, gru_state_size}));
-  CHECK((gru_bias_ih.sizes() == c10::IntArrayRef{3 * gru_state_size}));
   CHECK((gru_bias_hh.sizes() == c10::IntArrayRef{3 * gru_state_size}));
   CHECK((hidden_weights.sizes() ==
          c10::IntArrayRef{hidden_size, gru_state_size}));
@@ -60,8 +56,7 @@ Tensor wavernn_inference(
   CHECK((output_bias.sizes() == c10::IntArrayRef{output_size}));
 
   // Allocate temporary and output buffers.
-  Tensor gru_input = torch::zeros(gru_input_size);
-  Tensor gru_activations_ih = torch::zeros(3 * gru_state_size);
+  Tensor gru_input = torch::zeros(3 * gru_state_size);
   Tensor gru_activations_hh = torch::zeros(3 * gru_state_size);
   Tensor hidden = torch::zeros(hidden_size);
   Tensor logits = torch::zeros(output_size);
@@ -73,10 +68,9 @@ Tensor wavernn_inference(
   for (int timestep = 0; timestep < outputs.size(0); timestep++) {
     int frame_idx = timestep / hop_length;
     at::add_out(gru_input, sample_embeddings.index({prev_sample_a[0]}),
-                conditioning.index({frame_idx}));
-    at::addmv_out(gru_activations_ih, gru_bias_ih, gru_weights_ih, gru_input);
+                gru_activations_ih.index({frame_idx}));
     at::addmv_out(gru_activations_hh, gru_bias_hh, gru_weights_hh, gru_state);
-    gru_nonlinearity(gru_state, gru_activations_ih, gru_activations_hh);
+    gru_nonlinearity(gru_state, gru_input, gru_activations_hh);
     at::addmv_out(hidden, hidden_bias, hidden_weights, gru_state);
     at::relu_(hidden);
     at::addmv_out(logits, output_bias, output_weights, hidden);

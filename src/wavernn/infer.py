@@ -6,6 +6,7 @@ import os
 from omegaconf import OmegaConf
 from tqdm import tqdm  # type: ignore
 import click
+import librosa # type: ignore
 import numpy as np
 import soundfile  # type: ignore
 
@@ -64,8 +65,9 @@ def infer(  # pylint: disable=missing-param-doc
     dataset = AudioDataset([input_file], model_config.data)
     clips = list(dataset.load_samples_from(input_file))
 
-    sample_rate = model_config.data.mel.sample_rate
-    total_samples: int = sum(int(clip.waveform.size) for clip in clips)  # type: ignore
+    mel = model_config.data.mel
+    sample_rate = mel.sample_rate
+    total_samples: int = sum(int(clip.waveform.numel()) for clip in clips)
     total_secs = total_samples / sample_rate
 
     synthesized_clips = []
@@ -76,4 +78,10 @@ def infer(  # pylint: disable=missing-param-doc
             synthesized_clips.append(synthesized)
             progress.update(synthesized.size / sample_rate)
 
-    soundfile.write(output_file, np.concatenate(synthesized_clips), sample_rate)
+    # If necessary, apply de-emphasis (inverse of pre-emphasis) to the signal.
+    waveform = np.concatenate(synthesized_clips)
+    if mel.pre_emphasis > 0:
+        waveform = librosa.effects.deemphasis(waveform, coef=mel.pre_emphasis)
+        waveform = np.clip(waveform, -0.9999, 0.9999)
+
+    soundfile.write(output_file, waveform, sample_rate)

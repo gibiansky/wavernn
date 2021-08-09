@@ -63,6 +63,9 @@ class MelConfig:
     # Log mel spectrogram is ln(clip(mel_spectrogram, log_epsilon)).
     log_epsilon: float = MISSING
 
+    # Pre-emphasis filter to apply to the waveform prior to feature extraction.
+    pre_emphasis: float = MISSING
+
 
 @dataclass
 class DataConfig:
@@ -174,7 +177,15 @@ class AudioDataset(torch.utils.data.IterableDataset):
         sr: int
         raw_waveform, sr = librosa.load(filename, sr=mel.sample_rate)
 
+        if mel.pre_emphasis > 0:
+            raw_waveform = librosa.effects.preemphasis(
+                raw_waveform, coef=mel.pre_emphasis
+            )
+
         # Ensure samples are all in (-1, 1).
+        # This happens very rarely on raw audio but if you apply pre-emphasis
+        # then it happens to a small fraction (0.01% or less) of a small
+        # fraction (5-10%) of audio files.
         raw_waveform = np.clip(raw_waveform, -0.9999999, 0.9999999)
 
         # Pad waveform with silence at the end. Our spectrogram frames are
@@ -212,13 +223,13 @@ class AudioDataset(torch.utils.data.IterableDataset):
         log_epsilon = torch.tensor(mel.log_epsilon, dtype=torch.float32)
         for i in range(0, spectrogram.shape[1], clip_frames):
             desired_frames = clip_frames + 2 * padding_frames
-            clip_spectrogram = spectrogram[:, i : i + desired_frames]
+            clip_spectrogram = torch.from_numpy(spectrogram[:, i : i + desired_frames])
             if clip_spectrogram.shape[1] != desired_frames:
                 continue
 
             start_sample = (i + padding_frames) * mel.hop_length
             end_sample = start_sample + clip_frames * mel.hop_length
-            clip_waveform = padded_waveform[start_sample:end_sample]
+            clip_waveform = torch.from_numpy(padded_waveform[start_sample:end_sample])
             log_spectrogram = torch.log(torch.maximum(clip_spectrogram, log_epsilon))
             yield AudioSample(waveform=clip_waveform, spectrogram=log_spectrogram)
 
