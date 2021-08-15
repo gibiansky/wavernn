@@ -1,0 +1,26 @@
+---
+Checks: >
+  bugprone-*,
+  performance-*,
+  readability-*,
+  portability-*,
+  google-*,
+  misc-*,
+  hicpp-*,
+  cppcoreguidelines-*,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-macro-usage,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-member-init,
+  -hicpp-member-init,
+  -hicpp-signed-bitwise,
+  -hicpp-uppercase-literal-suffix,
+  -hicpp-use-auto,
+  -modernize-use-auto,
+  -modernize-use-trailing-return-type,
+  -portability-simd-intrinsics,
+  -readability-magic-numbers,
+  -readability-uppercase-literal-suffix,
+  -google-runtime-int,
+...
+

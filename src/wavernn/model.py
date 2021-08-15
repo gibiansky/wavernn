@@ -2,7 +2,7 @@
 WaveRNN model definition.
 """
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Tuple, Optional, Any
+from typing import Iterable, Iterator, Tuple, Optional, Any, NamedTuple
 
 from omegaconf import MISSING
 from torch import Tensor
@@ -131,23 +131,6 @@ class AutoregressiveRNN(torch.nn.Module):
         assert state is not None
         return torch.nn.functional.relu(self.post_gru(x)), state
 
-    def extract_weights(self) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """
-        Extract the weights from this layer.
-
-        Returns:
-          A tuple containing (gru weights_ih, gru weights_hh, gru bias_ih, gru
-          bias_hh, hidden weights, hidden bias).
-        """
-        return (  # type: ignore
-            self.gru.weight_ih_l0,
-            self.gru.weight_hh_l0,
-            self.gru.bias_ih_l0,
-            self.gru.bias_hh_l0,
-            self.post_gru.weight,
-            self.post_gru.bias,
-        )
-
 
 @dataclass
 class OutputConfig:
@@ -247,7 +230,7 @@ class DiscretizedMuLaw(torch.nn.Module):
           Sample of shape [1].
         """
         logits = self.linear(hidden)
-        distribution = torch.nn.functional.softmax(logits)
+        distribution = torch.nn.functional.softmax(logits, dim=0)
         return torch.multinomial(distribution, num_samples=1)
 
     def loss(self, hidden: Tensor, target: Tensor) -> Tensor:
@@ -276,6 +259,8 @@ class OptimizerConfig:
     """Configuration for the optimizer."""
 
     learning_rate: float = MISSING
+    decay_rate: float = MISSING
+    decay_iterations: list[float] = MISSING
 
 
 @dataclass
@@ -290,6 +275,22 @@ class Config:
     output: OutputConfig = MISSING
     optimizer: OptimizerConfig = MISSING
     prune: PruneConfig = MISSING
+
+
+class ModelWeights(NamedTuple):
+    """
+    Weight and bias matrices for WaveRNN.
+    """
+
+    gru_weight_ih: Tensor
+    gru_weight_hh: Tensor
+    gru_bias_ih: Tensor
+    gru_bias_hh: Tensor
+    hidden_weight: Tensor
+    hidden_bias: Tensor
+    sample_embeddings: Tensor
+    output_weight: Tensor
+    output_bias: Tensor
 
 
 class Model(pl.LightningModule):
@@ -365,6 +366,28 @@ class Model(pl.LightningModule):
         return loss
 
     @torch.no_grad()
+    def on_train_batch_start(
+        self, *args: Any  # pylint: disable=unused-argument
+    ) -> None:
+        """
+        Called before each training batch.
+
+        Used to set learning rate.
+
+        Args:
+          args: Unused arguments we don't need.
+        """
+        opt = self.config.optimizer
+        lr = opt.learning_rate
+        for it in opt.decay_iterations:
+            if self.global_step >= it:
+                lr *= opt.decay_rate
+
+        optimizer = self.optimizers().optimizer  # type: ignore
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr
+
+    @torch.no_grad()
     def on_train_batch_end(self, *args: Any) -> None:  # pylint: disable=unused-argument
         """
         Called after each training batch.
@@ -374,20 +397,11 @@ class Model(pl.LightningModule):
         Args:
           args: Unused arguments we don't need.
         """
-        output_weights: Tensor = self.domain.linear.weight  # type: ignore
-        (
-            gru_weights_ih,
-            gru_weights_hh,
-            _gru_bias_ih,
-            _gru_bias_hh,
-            hidden_weights,
-            _hidden_bias,
-        ) = self.autoregressive.extract_weights()
+        weights = self.weights()
         sparse_matrices = [
-            output_weights,
-            gru_weights_ih,
-            gru_weights_hh,
-            hidden_weights,
+            weights.output_weight,
+            weights.gru_weight_hh,
+            weights.hidden_weight,
         ]
         prune(
             config=self.config.prune,
@@ -403,6 +417,25 @@ class Model(pl.LightningModule):
                 total_params += matrix.numel()
                 nonzero_params += torch.sum(matrix.abs() > 0.0).cpu()
             self.log("remaining_fraction", nonzero_params / total_params)
+
+    def weights(self) -> ModelWeights:
+        """
+        Extract the weights from this model.
+
+        Returns:
+          A ModelWeights tuple containing all the labeled model weights.
+        """
+        return ModelWeights(
+            gru_weight_ih=self.autoregressive.gru.weight_ih_l0,  # type: ignore
+            gru_weight_hh=self.autoregressive.gru.weight_hh_l0,  # type: ignore
+            gru_bias_ih=self.autoregressive.gru.bias_ih_l0,  # type: ignore
+            gru_bias_hh=self.autoregressive.gru.bias_hh_l0,  # type: ignore
+            hidden_weight=self.autoregressive.post_gru.weight,  # type: ignore
+            hidden_bias=self.autoregressive.post_gru.bias,  # type: ignore
+            sample_embeddings=self.domain.embedding.weight,  # type: ignore
+            output_weight=self.domain.linear.weight,  # type: ignore
+            output_bias=self.domain.linear.bias,  # type: ignore
+        )
 
     def loss(self, batch: AudioSample) -> Tensor:
         """
@@ -469,7 +502,7 @@ class Model(pl.LightningModule):
 
     @torch.no_grad()
     def infer(
-        self, spectrograms: Iterable[Tensor], native: bool = True
+        self, spectrograms: Iterable[Tensor], native: bool = True, timing: bool = False
     ) -> Iterator[np.ndarray]:
         """Run inference to generate audio.
 
@@ -480,6 +513,7 @@ class Model(pl.LightningModule):
               easiest way to get this is to load an AudioDataset (as if training)
               and extract the samples that way.
           native: Whether to use native inference (C++) or Pytorch inference (Python).
+          timing: Whether to print timing information from the kernel.
 
         Yields:
           Generated audio samples, one per input spectrogram. Output arrays
@@ -490,41 +524,34 @@ class Model(pl.LightningModule):
 
         # Extract hyperparameters and weights from the model.
         hop_length = self.config.data.mel.hop_length
-        sample_embeddings: Tensor = self.domain.embedding.weight # type: ignore
-        output_weights = self.domain.linear.weight
-        output_bias = self.domain.linear.bias
-        (
-            gru_weights_ih,
-            gru_weights_hh,
-            gru_bias_ih,
-            gru_bias_hh,
-            hidden_weights,
-            hidden_bias,
-        ) = self.autoregressive.extract_weights()
+        weights = self.weights()
 
         final_sample = torch.full((1,), 128, dtype=torch.int64)
         final_state = torch.zeros((self.config.autoregressive.gru_dimension))
 
-        sample_activations = torch.mm(sample_embeddings, gru_weights_ih.t())
+        sample_activations = torch.mm(
+            weights.sample_embeddings, weights.gru_weight_ih.t()
+        )
         for spectrogram in spectrograms:
             hidden = self.conditioner(spectrogram.unsqueeze(0))
             conditioning = hidden.squeeze(0).transpose(0, 1)
             if native:
                 activations_ih = torch.addmm(
-                    gru_bias_ih, conditioning, gru_weights_ih.t()
+                    weights.gru_bias_ih, conditioning, weights.gru_weight_ih.t()
                 )
                 samples = torch.ops.wavernn.wavernn_inference(
                     activations_ih,
                     final_sample,
                     final_state,
                     sample_activations,
-                    gru_weights_hh,
-                    gru_bias_hh,
-                    hidden_weights,
-                    hidden_bias,
-                    output_weights,
-                    output_bias,
+                    weights.gru_weight_hh,
+                    weights.gru_bias_hh,
+                    weights.hidden_weight,
+                    weights.hidden_bias,
+                    weights.output_weight,
+                    weights.output_bias,
                     hop_length,
+                    timing,
                 )
             else:
                 samples, final_sample, final_state = self.pytorch_inference(

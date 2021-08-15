@@ -76,6 +76,7 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+*.ipynb
 
 # IPython
 profile_default/
@@ -135,3 +136,7 @@ lightning_logs
 # Known datasets
 ljspeech
 *.wav
+
+# Doxygen things
+src/kernel/docs
+*.gif

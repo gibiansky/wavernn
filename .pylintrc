@@ -166,6 +166,7 @@ disable=print-statement,
         line-too-long,
         too-many-locals,
         arguments-differ,
+        too-many-arguments,
 
 # Enable the message, report, category or checker with the given id(s). You can
 # either give multiple identifier separated by comma (,) or put this option
@@ -390,7 +391,7 @@ ignore-imports=no
 ignore-signatures=no
 
 # Minimum lines number of a similarity.
-min-similarity-lines=4
+min-similarity-lines=20
 
 
 [BASIC]

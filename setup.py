@@ -31,8 +31,9 @@ setuptools.setup(
     ext_modules=[
         CppExtension(
             "wavernn_kernel",
-            ["src/kernel/kernel.cpp"],
-            libraries=[],
+            ["src/kernel/kernel.cpp", "src/kernel/gemv.cpp"],
+            libraries=["mkl_rt"],
+            extra_compile_args=["-ffast-math", "-march=native", "-fopenmp"],
         )
     ],
     cmdclass={"build_ext": BuildExtension.with_options(no_python_abi_suffix=True)},

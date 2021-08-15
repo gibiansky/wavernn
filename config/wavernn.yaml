@@ -19,15 +19,15 @@ conditioner:
   layers: 3
   channels: 256
   width: 5
-  normalization_shift: 5.0
+  normalization_shift: -2.0
   normalization_scale: 5.0
 
 autoregressive:
-  gru_dimension: 512
+  gru_dimension: 1024
   hidden_dimension: 512
 
 prune:
-  final_sparsity: 0.9
+  final_sparsity: 0.94
   start_iteration: 100000
   stop_iteration: 500000
   block: [8, 8]
@@ -38,3 +38,5 @@ output:
 
 optimizer:
   learning_rate: 2.0e-4
+  decay_rate: 0.1
+  decay_iterations: [2000000, 2500000]
