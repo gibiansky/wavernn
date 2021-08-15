@@ -5,3 +5,7 @@ requires = [
     "torch==1.9.0",
 ]
 build-backend = "setuptools.build_meta"
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3

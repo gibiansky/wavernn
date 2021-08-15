@@ -2,18 +2,17 @@
 Training entrypoint for WaveRNN.
 """
 import os
-from typing import Optional
 import shutil
+from typing import Optional
 
-from omegaconf import OmegaConf
-from pytorch_lightning.loggers import TensorBoardLogger
 import click
 import pytorch_lightning as pl
+from omegaconf import OmegaConf
+from pytorch_lightning.loggers import TensorBoardLogger
 
-
-from wavernn.util import die_if
-from wavernn.model import Model, Config, VALIDATION_LOSS_KEY
 from wavernn.dataset import AudioDataModule
+from wavernn.model import VALIDATION_LOSS_KEY, Config, Model
+from wavernn.util import die_if
 
 # Name of the config file to store.
 CONFIG_PATH: str = "config.yaml"

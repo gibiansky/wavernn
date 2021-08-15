@@ -4,8 +4,8 @@ Main entrypoint for WaveRNN package.
 import click
 
 import wavernn.dataset
-import wavernn.train
 import wavernn.infer
+import wavernn.train
 
 
 @click.group()

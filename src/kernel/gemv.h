@@ -2,25 +2,9 @@
 
 #include <torch/script.h>
 
-using torch::Tensor;
+#include <vector>
 
-// Assert that a tensor's size matches what we expect.
-#define STRINGIFY(X) #X
-#define ASSERT_TENSOR_SIZE(_tensor, ...)                                       \
-  {                                                                            \
-    if ((_tensor).sizes() != c10::IntArrayRef{__VA_ARGS__}) {                  \
-      throw std::runtime_error(__FILE__ ":" STRINGIFY(                         \
-          __LINE__) " Tensor " #_tensor " size does not match " #__VA_ARGS__); \
-    }                                                                          \
-  }
-
-#define ASSERT_BOOL(_cond)                                            \
-  {                                                                   \
-    if (!(_cond)) {                                                   \
-      throw std::runtime_error(                                       \
-          __FILE__ ":" STRINGIFY(__LINE__) " Failed check: " #_cond); \
-    }                                                                 \
-  }
+namespace wavernn {
 
 /**
  * Our WaveRNN inference kernel can be accelerated through the use of
@@ -39,19 +23,19 @@ using torch::Tensor;
  * the matrix has been created, the gemv() function (gemv for GEneral
  * Matrix-Vector multiply) may be used to multiply a vector by the given matrix.
  */
-class SparsePackedMatrix {
+class PackedLinear {
  public:
   /// Create a new packed packed matrix. The sparsity of the matrix is detected
   /// automatically, so for maximum efficiency, the matrix should be a
   /// block-sparse matrix with sparsity >= 50%.
   /// @param matrix The float32 matrix of shape [output_size, input_size].
   /// @param bias The float32 bias vector of shape [output_size].
-  SparsePackedMatrix(const Tensor& matrix, const Tensor& bias);
+  PackedLinear(const torch::Tensor& matrix, const torch::Tensor& bias);
 
   /// Multiply a vector by this matrix.
   /// @param out Output float32 tensor of shape [output_size].
   /// @param vector Input float32 vector of shape [input_size].
-  void gemv(const Tensor& out, const Tensor& vector) const;
+  void gemv(const torch::Tensor& out, const torch::Tensor& vector) const;
 
  private:
   /// The output size of the matrix.
@@ -76,8 +60,10 @@ class SparsePackedMatrix {
 
   /// The original matrix of size [output_size, input_size].
   /// Used if we can't use our AVX sparse gemv.
-  const Tensor& matrix_;
+  const torch::Tensor& matrix_;
 
   /// The bias tensor of size [output_size].
-  const Tensor& bias_;
+  const torch::Tensor& bias_;
 };
+
+}  // namespace wavernn

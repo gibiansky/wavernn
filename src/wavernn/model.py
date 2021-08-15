@@ -2,17 +2,17 @@
 WaveRNN model definition.
 """
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Tuple, Optional, Any, NamedTuple
+from typing import Any, Iterable, Iterator, NamedTuple, Optional, Tuple
 
-from omegaconf import MISSING
-from torch import Tensor
 import numpy as np
 import pytorch_lightning as pl
 import torch
+from omegaconf import MISSING
+from torch import Tensor
 
-from wavernn.dataset import DataConfig, AudioSample
-from wavernn.util import die_if
+from wavernn.dataset import AudioSample, DataConfig
 from wavernn.prune import PruneConfig, prune
+from wavernn.util import die_if
 
 # Key under which to log validation loss.
 VALIDATION_LOSS_KEY: str = "validation_loss"

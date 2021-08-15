@@ -31,7 +31,12 @@ setuptools.setup(
     ext_modules=[
         CppExtension(
             "wavernn_kernel",
-            ["src/kernel/kernel.cpp", "src/kernel/gemv.cpp"],
+            [
+                "src/kernel/kernel.cpp",
+                "src/kernel/gemv.cpp",
+                "src/kernel/ops.cpp",
+                "src/kernel/timer.cpp",
+            ],
             libraries=["mkl_rt"],
             extra_compile_args=["-ffast-math", "-march=native", "-fopenmp"],
         )

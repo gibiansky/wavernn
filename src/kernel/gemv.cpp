@@ -1,14 +1,19 @@
 
+#include "gemv.h"
+
 #include <immintrin.h>
 #include <mkl/mkl.h>
 #include <omp.h>
 #include <torch/script.h>
 
-#include "kernel.h"
+#include "wavernn_assert.h"
 
 constexpr int BLOCK_SIZE = 8;
+#define USE_SPARSE_GEMV
 
 using torch::Tensor;
+
+namespace {
 
 /// Sum up the values in an AVX 256-bit XMM register and return them as a float.
 /// Implementation courageously borrowed from Marat Dukhan's StackOverflow
@@ -40,7 +45,10 @@ inline float sum8(__m256 x) {
   return _mm_cvtss_f32(sum);
 }
 
-SparsePackedMatrix::SparsePackedMatrix(const Tensor& matrix, const Tensor& bias)
+}  // namespace
+
+namespace wavernn {
+PackedLinear::PackedLinear(const Tensor& matrix, const Tensor& bias)
     : matrix_(matrix), bias_(bias) {
   output_size_ = matrix.size(0);
   input_size_ = matrix.size(1);
@@ -77,10 +85,12 @@ SparsePackedMatrix::SparsePackedMatrix(const Tensor& matrix, const Tensor& bias)
   }
 }
 
-void SparsePackedMatrix::gemv(const Tensor& out, const Tensor& vector) const {
+void PackedLinear::gemv(const Tensor& out, const Tensor& vector) const {
   ASSERT_TENSOR_SIZE(out, output_size_);
   ASSERT_TENSOR_SIZE(vector, input_size_);
-
+#ifndef USE_SPARSE_GEMV
+  at::addmv_out(out, bias_, matrix_, vector);
+#else
   float* const __restrict__ output = out.data_ptr<float>();
   const float* const __restrict__ input = vector.data_ptr<float>();
   const float* const __restrict__ weights = data_.data();
@@ -139,4 +149,6 @@ void SparsePackedMatrix::gemv(const Tensor& out, const Tensor& vector) const {
     }
     output[output_idx] = bias[output_idx] + sum8(sum_vec);
   }
+#endif
 }
+}  // namespace wavernn

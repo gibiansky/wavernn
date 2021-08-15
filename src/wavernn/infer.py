@@ -4,19 +4,19 @@ Inference entrypoint for WaveRNN.
 import os
 import time
 
-from omegaconf import OmegaConf
-from tqdm import tqdm  # type: ignore
 import click
 import librosa  # type: ignore
 import numpy as np
 import soundfile  # type: ignore
 import torch
+from omegaconf import OmegaConf
+from tqdm import tqdm  # type: ignore
 
-from wavernn.util import die_if
-from wavernn.model import Model, Config
-from wavernn.train import CONFIG_PATH, CHECKPOINTS_DIR, BEST_CHECKPOINT
 from wavernn.dataset import AudioDataset
-from wavernn.prune import prune, PruneConfig
+from wavernn.model import Config, Model
+from wavernn.prune import PruneConfig, prune
+from wavernn.train import BEST_CHECKPOINT, CHECKPOINTS_DIR, CONFIG_PATH
+from wavernn.util import die_if
 
 INFERENCE_BAR_FMT = "{l_bar}{bar}| {n:.02f}/{total:.2f} [{rate_noinv_fmt}]"
 

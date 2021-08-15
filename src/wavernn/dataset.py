@@ -1,20 +1,20 @@
 """
 Dataset-handling entrypoint for WaveRNN package.
 """
-from dataclasses import dataclass
 import glob
-import os
 import json
-from typing import Iterator, Optional, NamedTuple
+import os
+from dataclasses import dataclass
+from typing import Iterator, NamedTuple, Optional
 
-from omegaconf import MISSING
 import click
-import pytorch_lightning as pl
-import torch
 import librosa  # type: ignore
 import numpy as np
+import pytorch_lightning as pl
+import torch
+from omegaconf import MISSING
 
-from wavernn.util import download, die_if, cmd
+from wavernn.util import cmd, die_if, download
 
 # Public-facing dataset names.
 NAME_LJSPEECH: str = "ljspeech"
