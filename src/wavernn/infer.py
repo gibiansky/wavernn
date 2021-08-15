@@ -135,7 +135,6 @@ def benchmark(  # pylint: disable=missing-param-doc
     start_time = time.time()
     samples = next(model.infer([spectrogram[:, :bench_frames]], timing=True))
     elapsed = time.time() - start_time
-    print(elapsed)
 
     synthesized_seconds = samples.size / model_config.data.mel.sample_rate
     synthesis_rate = synthesized_seconds / elapsed

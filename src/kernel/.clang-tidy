@@ -22,5 +22,7 @@ Checks: >
   -readability-magic-numbers,
   -readability-uppercase-literal-suffix,
   -google-runtime-int,
+  -google-runtime-references,
+  -clang-diagnostic-c++17-extensions,
 ...
 

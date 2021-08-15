@@ -4,6 +4,7 @@ Dataset-handling entrypoint for WaveRNN package.
 import glob
 import json
 import os
+import random
 from dataclasses import dataclass
 from typing import Iterator, NamedTuple, Optional
 
@@ -115,17 +116,22 @@ class AudioDataset(torch.utils.data.IterableDataset):
     A dataset of audio waveforms and mel spectrograms.
     """
 
-    def __init__(self, globs: list[str], config: DataConfig) -> None:
+    def __init__(
+        self, globs: list[str], config: DataConfig, shuffle: bool = False
+    ) -> None:
         """
         Create a new dataset.
 
         Args:
           globs: The filename globs to use for the input data.
           config: The dataset configuration.
+          shuffle: Whether to shuffle the files during iteration.
+            Should be set to True for the training dataset.
         """
         super().__init__()
 
         self.config = config
+        self.shuffle = shuffle
 
         # Collect all files in this dataset.
         self.filenames: list[str] = []
@@ -149,6 +155,9 @@ class AudioDataset(torch.utils.data.IterableDataset):
                 for i, filename in enumerate(self.filenames)
                 if i % worker_info.num_workers == worker_info.id  # type:ignore
             ]
+
+        if self.shuffle:
+            random.shuffle(filenames)
 
         for filename in filenames:
             yield from self.load_samples_from(filename)
@@ -266,7 +275,7 @@ class AudioDataModule(pl.LightningDataModule):
         with open(listing_path, "r") as handle:
             listing = json.load(handle)
 
-        self.train_set = AudioDataset(listing[TRAIN_KEY], self.config)
+        self.train_set = AudioDataset(listing[TRAIN_KEY], self.config, shuffle=True)
         self.valid_set = AudioDataset(listing[VALID_KEY], self.config)
         self.test_set = AudioDataset(listing[TEST_KEY], self.config)
 

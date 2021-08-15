@@ -27,6 +27,29 @@ class PruneConfig:
     block: Tuple[int, int] = MISSING
 
 
+def prune_fraction(step: int, config: PruneConfig) -> float:
+    """
+    Compute what fraction of weights should be pruned.
+
+    Args:
+      step: The current training step.
+      config: The pruning configuration for the model.
+
+    Returns:
+      The fraction of weights that should be set to zero after this step.
+    """
+    if step <= config.start_iteration:
+        return 0.0
+
+    # Compute the fraction to prune right now.
+    if step >= config.stop_iteration:
+        return config.final_sparsity
+
+    prune_iterations = config.stop_iteration - config.start_iteration
+    remaining = (config.stop_iteration - step) / prune_iterations
+    return config.final_sparsity * (1 - remaining ** 3)
+
+
 @torch.no_grad()
 def prune(config: PruneConfig, parameters: list[torch.Tensor], step: int) -> None:
     """
@@ -37,16 +60,9 @@ def prune(config: PruneConfig, parameters: list[torch.Tensor], step: int) -> Non
       parameters: The parameters to prune.
       step: The current step of training.
     """
-    if step <= config.start_iteration:
+    fraction = prune_fraction(step, config)
+    if fraction == 0:
         return
-
-    # Compute the fraction to prune right now.
-    if step >= config.stop_iteration:
-        fraction = config.final_sparsity
-    else:
-        prune_iterations = config.stop_iteration - config.start_iteration
-        remaining = (config.stop_iteration - step) / prune_iterations
-        fraction = config.final_sparsity * (1 - remaining ** 3)
 
     # Compute the magnitude of each block of each parameter.
     parameter_block_magnitudes = [

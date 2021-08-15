@@ -35,7 +35,7 @@ class PackedLinear {
   /// Multiply a vector by this matrix.
   /// @param out Output float32 tensor of shape [output_size].
   /// @param vector Input float32 vector of shape [input_size].
-  void gemv(const torch::Tensor& out, const torch::Tensor& vector) const;
+  void gemv(torch::Tensor& out, const torch::Tensor& vector) const;
 
  private:
   /// The output size of the matrix.
