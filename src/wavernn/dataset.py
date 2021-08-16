@@ -270,6 +270,9 @@ class AudioDataModule(pl.LightningDataModule):
           stage: Which stage to set up. If stage is None, set up all stages.
             Stage can also be 'fit', 'validate', or 'test'.
         """
+        if self.train_set is not None:
+            return
+
         # Load the listing.
         listing_path = os.path.join(self.config.path, DATASET_JSON)
         with open(listing_path, "r") as handle:

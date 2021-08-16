@@ -20,6 +20,9 @@ VALIDATION_LOSS_KEY: str = "validation_loss"
 # Key under which to log train loss.
 TRAIN_LOSS_KEY: str = "train_loss"
 
+# Number of frames needed to compute normalization statistics.
+NORMALIZATION_FRAMES: int = 100_000
+
 
 @dataclass
 class ConditionerConfig:
@@ -33,12 +36,6 @@ class ConditionerConfig:
 
     # The kernel width for each of the convolutional layers.
     width: int = MISSING
-
-    # How much to shift (subtract) the input mels by prior to scaling and convolving.
-    normalization_shift: float = MISSING
-
-    # How much to scale (divide) the input mels by prior to convolving after shifting.
-    normalization_scale: float = MISSING
 
 
 class Conditioner(torch.nn.Module):
@@ -65,8 +62,21 @@ class Conditioner(torch.nn.Module):
 
         self.model: torch.nn.Module = torch.nn.Sequential(*layers)
 
-        self.normalization_shift: float = config.normalization_shift
-        self.normalization_scale: float = config.normalization_scale
+        # The input minimum and maximum value. Must be computed from data and
+        # set later. Will error in forward() if it's not set.
+        self.register_buffer("input_range", torch.zeros(2))
+
+    def set_input_range(self, low: float, high: float) -> None:
+        """
+        Set the input feature range. This be used for feature
+        normalization prior to running the conditioning subnetwork.
+
+        Args:
+          low: The minimum expected feature value.
+          high: The maximum expected feature value.
+        """
+        self.input_range[0] = low  # type: ignore
+        self.input_range[1] = high  # type: ignore
 
     def forward(self, mels: Tensor) -> Tensor:
         """Run the network.
@@ -77,7 +87,15 @@ class Conditioner(torch.nn.Module):
         Returns:
           Network outputs of shape [batch, channels, output_timesteps].
         """
-        return self.model((mels - self.normalization_shift) / self.normalization_scale)
+        low = self.input_range[0]  # type: ignore
+        high = self.input_range[1]  # type: ignore
+
+        center = (low + high) / 2
+        scale = (high - low) / 2
+        assert scale.cpu().item() > 0
+
+        normalized = (mels + center) / scale
+        return self.model(normalized)
 
 
 @dataclass
@@ -319,6 +337,7 @@ class Model(pl.LightningModule):
             config.conditioner.channels,
             config.autoregressive.hidden_dimension,
         )
+        self.input_stats_initialized: bool = False
 
     def configure_optimizers(self) -> torch.optim.Adam:
         """
@@ -467,6 +486,40 @@ class Model(pl.LightningModule):
         predictions, _ = self.autoregressive(hidden)
 
         return self.domain.loss(predictions[:, :-1, :], batch.waveform[:, 1:])
+
+    @torch.no_grad()
+    def initialize_input_stats(self, data: torch.utils.data.DataLoader) -> None:
+        """
+        Compute spectrogram mean and variance for each spectrogram band. These
+        means and variances are then used during training to normalize the
+        input features. Computing mean and variance from data gets us more
+        precise values and avoids requiring the user to do it as a separate
+        step.
+
+        Args:
+          data: The training data data loader.
+        """
+        print("Computing dataset feature statistics...")
+
+        padding_frames = self.config.data.padding_frames
+        n_mels = self.config.data.mel.n_mels
+
+        # Collect sufficient frames to compute statistics.
+        num_frames = 0
+        frames = []
+        for batch in data:
+            spectrogram = batch.spectrogram[:, padding_frames:-padding_frames]
+            spectrogram = spectrogram.transpose(1, 2).reshape((-1, n_mels))
+            num_frames += spectrogram.shape[0]
+            frames.append(spectrogram)
+            if num_frames >= NORMALIZATION_FRAMES:
+                break
+
+        # Compute statistics and put them in the conditioner.
+        spectrograms = torch.cat(frames, dim=0)
+        low = spectrograms.min().item()
+        high = spectrograms.max().item()
+        self.conditioner.set_input_range(low, high)
 
     def pytorch_inference(
         self, conditioning: Tensor, prev_sample: Tensor, init_state: Tensor

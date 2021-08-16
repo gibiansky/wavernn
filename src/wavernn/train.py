@@ -61,6 +61,14 @@ def train(  # pylint: disable=missing-param-doc
     # Load the dataset from the config.
     data_module = AudioDataModule(model_config.data)
 
+    best_path = os.path.join(path, CHECKPOINTS_DIR, BEST_CHECKPOINT + ".ckpt")
+    if os.path.exists(best_path):
+        model = Model.load_from_checkpoint(best_path, config=model_config)
+    else:
+        model = Model(model_config)
+        data_module.setup()
+        model.initialize_input_stats(data_module.train_dataloader())
+
     # Train the model.
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         monitor=VALIDATION_LOSS_KEY,
@@ -68,12 +76,9 @@ def train(  # pylint: disable=missing-param-doc
         filename=BEST_CHECKPOINT,
         mode="min",
     )
-    best_path = os.path.join(path, CHECKPOINTS_DIR, BEST_CHECKPOINT + ".ckpt")
-    resume_from_checkpoint = best_path if os.path.exists(best_path) else None
     logger = TensorBoardLogger(save_dir=path, version="logs")
     trainer = pl.Trainer(
         callbacks=[checkpoint_callback],
-        resume_from_checkpoint=resume_from_checkpoint,
         val_check_interval=test_every,
         logger=logger,
         gpus=1,
