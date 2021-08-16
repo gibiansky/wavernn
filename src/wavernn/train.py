@@ -34,8 +34,9 @@ BEST_CHECKPOINT: str = "best"
 @click.option(
     "--test-every", default=5000, help="How often to run validation during training"
 )
+@click.argument("overrides", multiple=True, help="Dotlist option overrides")
 def train(  # pylint: disable=missing-param-doc
-    config: Optional[str], path: str, test_every: int
+    config: Optional[str], path: str, test_every: int, overrides: list[str]
 ) -> None:
     """
     Train a WaveRNN.
@@ -46,7 +47,7 @@ def train(  # pylint: disable=missing-param-doc
     )
 
     saved_config_path = os.path.join(path, CONFIG_PATH)
-    if config is None:
+    if config is None or os.path.exists(saved_config_path):
         config = saved_config_path
         die_if(not os.path.exists(config), f"Missing config file {config}")
     else:
@@ -56,6 +57,7 @@ def train(  # pylint: disable=missing-param-doc
     # Create a model with the config.
     model_config: Config = OmegaConf.structured(Config)
     model_config.merge_with(OmegaConf.load(config))  # type: ignore
+    model_config.merge_with_dotlist(overrides)  # type: ignore
     model = Model(model_config)
 
     # Load the dataset from the config.
