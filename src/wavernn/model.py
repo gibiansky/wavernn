@@ -28,6 +28,16 @@ NORMALIZATION_FRAMES: int = 100_000
 class ConditionerConfig:
     """Configuration for WaveRNN conditioner."""
 
+    # WaveRNN consists of a conditioner network and an autoregressive network.
+    # The conditioner network takes as input log mel spectrograms (or other
+    # low-frequency acoustic features) and processes them with a fast neural
+    # network to generate conditioning inputs for the autoregressive network.
+    # These inputs guide the autoregressive network to produce speech matching
+    # the input features.
+    #
+    # This implementation of WaveRNN uses a simple stack of 1D convolutional
+    # layers with interspersed nonlinearities as a conditioner network.
+
     # Number of convolutional layers to use.
     layers: int = MISSING
 
@@ -39,10 +49,11 @@ class ConditionerConfig:
 
 
 class Conditioner(torch.nn.Module):
-    """The conditioning network for WaveRNN."""
+    """The conditioner network for WaveRNN."""
 
     def __init__(self, config: ConditionerConfig, n_mels: int) -> None:
-        """Create a new conditioning network.
+        """
+        Create a new conditioner network.
 
         Args:
           config: Configuration for this network.
@@ -69,7 +80,7 @@ class Conditioner(torch.nn.Module):
     def set_input_range(self, low: float, high: float) -> None:
         """
         Set the input feature range. This be used for feature
-        normalization prior to running the conditioning subnetwork.
+        normalization prior to running the conditioner subnetwork.
 
         Args:
           low: The minimum expected feature value.
@@ -79,7 +90,7 @@ class Conditioner(torch.nn.Module):
         self.input_range[1] = high  # type: ignore
 
     def forward(self, mels: Tensor) -> Tensor:
-        """Run the network.
+        """Normalize the input features and then run the network.
 
         Args:
           mels: Input spectrograms of shape [batch, n_mels, input_timesteps].
@@ -102,7 +113,19 @@ class Conditioner(torch.nn.Module):
 class AutoregressiveConfig:
     """Configuration for WaveRNN autoregressive network."""
 
-    # State dimension for the GRU.
+    # The main part of WaveRNN is an autoregressive recurrent neural network
+    # (RNN) which outputs a probability distribution over audio samples. The
+    # input to the network is the conditioning information (from the
+    # conditioner network) and the values of all past samples.
+    #
+    # The current autoregressive network for WaveRNN includes:
+    #
+    #   1. A sample embedding layer.
+    #   2. A GRU RNN.
+    #   3. A linear layer with a ReLU activation.
+    #   4. A linear layer with a softmax activation.
+
+    # State dimension for the GRU used in the autoregressive network.
     gru_dimension: int = MISSING
 
     # Output dimension of the linear layer after the GRU.
@@ -113,11 +136,12 @@ class AutoregressiveRNN(torch.nn.Module):
     """The autoregressive network for WaveRNN."""
 
     def __init__(self, config: AutoregressiveConfig, input_channels: int) -> None:
-        """Create a new autoregressive RNN.
+        """
+        Create a new autoregressive RNN.
 
         Args:
           config: Configuration for this network.
-          input_channels: How many channels the conditioning network outputs.
+          input_channels: How many channels the conditioner network outputs.
         """
         super().__init__()
 
@@ -154,6 +178,23 @@ class AutoregressiveRNN(torch.nn.Module):
 class OutputConfig:
     """Configuration for the input and output domain."""
 
+    # WaveRNN variants differ significantly by how they represent audio. For
+    # example, the simplest variant uses the original representation from the
+    # WaveNet paper, applying µ-law companding and quantization to the raw
+    # audio signal and modeling it with a discrete distribution. Other variants
+    # use a Mixture-of-Logistics (MoL) distribution, Gaussian distribution, or
+    # Mixture-of-Gaussians (MoG) distribution to model the companded (but not
+    # quantized) audio. Multi-band or linear predictive coding based WaveRNN
+    # variants replace the audio with a different representation entirely.
+    # Bit-bunching and sample-bunching allow sampling multiple times per
+    # timestep of the RNN.
+    #
+    # In order to easily mix all these variants in the same codebase without
+    # frustrating code duplication, we use the concept of an input / output
+    # domain. The input / output domain defines how audio is represented, how
+    # the probability distribution is predicted, and how to sample from that
+    # probability distribution.
+
     # What type of input / output domain to use.
     # Allowed values:
     #   - "discretized-mu-law": Standard WaveRNN with one discretized prediction.
@@ -172,7 +213,8 @@ class DiscretizedMuLaw(torch.nn.Module):
     def __init__(
         self, config: OutputConfig, embedding_channels: int, input_channels: int
     ) -> None:
-        """Create a new input and output domain.
+        """
+        Create a new input and output domain.
 
         Args:
           config: Configuration for this input and output domain.
@@ -276,8 +318,17 @@ class DiscretizedMuLaw(torch.nn.Module):
 class OptimizerConfig:
     """Configuration for the optimizer."""
 
+    # An AdamOptimier is used for optimization. The learning rate is updated at
+    # the specified iterations to decay it by the given rate.
+
+    # Base learning rate for the optimizer.
     learning_rate: float = MISSING
+
+    # When decaying, how much to multiply the learning rate by.
+    # For example, a value of 0.1 will make the learning rate 10x smaller.
     decay_rate: float = MISSING
+
+    # When to decay the learning rate. Measured in number of iterations.
     decay_iterations: list[float] = MISSING
 
 
@@ -287,11 +338,22 @@ class Config:
     Configuration for a WaveRNN model.
     """
 
+    # How to load data.
     data: DataConfig = MISSING
+
+    # Configuration for the conditioner subnetwork.
     conditioner: ConditionerConfig = MISSING
+
+    # Configuration for the autoregressive subnetwork.
     autoregressive: AutoregressiveConfig = MISSING
+
+    # Configuration for the input / output domain.
     output: OutputConfig = MISSING
+
+    # Configuration for the optimizer.
     optimizer: OptimizerConfig = MISSING
+
+    # Configuration for pruning the WaveRNN weight matrices.
     prune: PruneConfig = MISSING
 
 
@@ -300,15 +362,32 @@ class ModelWeights(NamedTuple):
     Weight and bias matrices for WaveRNN.
     """
 
+    # Input-to-hidden weight matrix of the GRU.
     gru_weight_ih: Tensor
+
+    # Hidden-to-hidden weight matrix of the GRU.
     gru_weight_hh: Tensor
+
+    # Input-to-hidden bias vector of the GRU.
     gru_bias_ih: Tensor
+
+    # Hidden-to-hidden bias vector of the GRU.
     gru_bias_hh: Tensor
+
+    # GRU-output-to-hidden-layer weight matrix.
     hidden_weight: Tensor
+
+    # GRU-output-to-hidden-layer bias vector.
     hidden_bias: Tensor
-    sample_embeddings: Tensor
+
+    # Hidden-layer-to-output-logits weight matrix.
     output_weight: Tensor
+
+    # Hidden-layer-to-output-logits bias vector.
     output_bias: Tensor
+
+    # Sample embeddings matrix (one embedding row per quantization value).
+    sample_embeddings: Tensor
 
 
 class Model(pl.LightningModule):
@@ -337,7 +416,6 @@ class Model(pl.LightningModule):
             config.conditioner.channels,
             config.autoregressive.hidden_dimension,
         )
-        self.input_stats_initialized: bool = False
 
     def configure_optimizers(self) -> torch.optim.Adam:
         """
@@ -346,6 +424,7 @@ class Model(pl.LightningModule):
         Returns:
           A properly-configured optimizer.
         """
+        # This method is required by PyTorch Lightning.
         return torch.optim.Adam(
             self.parameters(), lr=self.config.optimizer.learning_rate
         )
@@ -363,6 +442,7 @@ class Model(pl.LightningModule):
         Returns:
           The computed loss for this training batch.
         """
+        # This method is required by PyTorch Lightning.
         loss = self.loss(batch)
         self.log(TRAIN_LOSS_KEY, loss)
         return loss
@@ -380,6 +460,7 @@ class Model(pl.LightningModule):
         Returns:
           The computed loss for this training batch.
         """
+        # This method is required by PyTorch Lightning.
         loss = self.loss(batch)
         self.log(VALIDATION_LOSS_KEY, loss)
         return loss
@@ -396,6 +477,7 @@ class Model(pl.LightningModule):
         Args:
           args: Unused arguments we don't need.
         """
+        # This method is called by PyTorch Lightning.
         opt = self.config.optimizer
         lr = opt.learning_rate
         for it in opt.decay_iterations:
@@ -416,6 +498,7 @@ class Model(pl.LightningModule):
         Args:
           args: Unused arguments we don't need.
         """
+        # This method is called by PyTorch Lightning.
         weights = self.weights()
         sparse_matrices = [
             weights.output_weight,

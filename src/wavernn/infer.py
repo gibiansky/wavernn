@@ -15,10 +15,12 @@ from tqdm import tqdm  # type: ignore
 from wavernn.dataset import AudioDataset
 from wavernn.model import Config, Model
 from wavernn.prune import PruneConfig, prune
-from wavernn.train import BEST_CHECKPOINT, CHECKPOINTS_DIR, CONFIG_PATH
+from wavernn.train import CHECKPOINTS_DIR, CONFIG_PATH
 from wavernn.util import die_if
 
-INFERENCE_BAR_FMT = "{l_bar}{bar}| {n:.02f}/{total:.2f} [{rate_noinv_fmt}]"
+# Format string for tqdm progress bar used during audio synthesis with the
+# 'infer' command. Provides slightly more meaningful units than the default.
+INFERENCE_BAR_FMT: str = "{l_bar}{bar}| {n:.02f}/{total:.2f} [{rate_noinv_fmt}]"
 
 
 @click.command("infer")
@@ -43,17 +45,16 @@ def infer(  # pylint: disable=missing-param-doc
     path: str, input_file: str, output_file: str
 ) -> None:
     """
-    Infer with a trained WaveRNN.
+    Run copy-synthesis inference with a WaveRNN.
     """
     config_path = os.path.join(path, CONFIG_PATH)
-    die_if(not os.path.exists(config_path), f"Missing config path {config_path}")
+    checkpoint_path = os.path.join(path, CHECKPOINTS_DIR, "last.ckpt")
 
-    checkpoint_path = os.path.join(path, CHECKPOINTS_DIR, BEST_CHECKPOINT + ".ckpt")
+    die_if(not os.path.exists(config_path), f"Missing config path {config_path}")
     die_if(
         not os.path.exists(checkpoint_path),
         f"Missing checkpoint path {checkpoint_path}",
     )
-
     die_if(not input_file.endswith(".wav"), "--input argument must have .wav extension")
     die_if(
         not output_file.endswith(".wav"), "--output argument must have .wav extension"
@@ -65,14 +66,18 @@ def infer(  # pylint: disable=missing-param-doc
     model = Model.load_from_checkpoint(checkpoint_path, config=model_config)
 
     # Load the data using a dataset.
-    dataset = AudioDataset([input_file], model_config.data)
+    dataset = AudioDataset(
+        os.path.dirname(input_file), [os.path.basename(input_file)], model_config.data
+    )
     clips = list(dataset.load_samples_from(input_file))
 
+    # Compute expected audio duration.
     mel = model_config.data.mel
     sample_rate = mel.sample_rate
     total_samples: int = sum(int(clip.waveform.numel()) for clip in clips)
     total_secs = total_samples / sample_rate
 
+    # Synthesize with a nice progress bar.
     synthesized_clips = []
     with tqdm(total=total_secs, bar_format=INFERENCE_BAR_FMT, unit="sec") as progress:
         for synthesized in model.infer(clip.spectrogram for clip in clips):
@@ -107,7 +112,17 @@ def benchmark(  # pylint: disable=missing-param-doc
     model_config.merge_with(OmegaConf.load(config))  # type: ignore
     model = Model(config=model_config)
 
+    # Set the model input range.
+    model.conditioner.set_input_range(-2, 2)
+
     # Apply pruning (as if we had trained to completion).
+    #
+    # Note: Since the matrices are different sizes, the initial weights will
+    # have different magnitudes. Since pruning is magnitude-based, this will
+    # significantly affect which weights are pruned and skew benchmark results.
+    # For example, the output matrix is usually smallest and thus has the
+    # largest weight magnitudes (due to Xavier initialization), and thus will
+    # have near zero sparsity.
     weights = model.weights()
     sparse_matrices = [
         weights.output_weight,
@@ -120,14 +135,11 @@ def benchmark(  # pylint: disable=missing-param-doc
         step=model_config.prune.stop_iteration,
     )
 
-    # Generate values in the right range for the conditioner.
+    # Generate test input values.
     max_frames = max(warmup_frames, bench_frames)
-    spectrogram = (
-        torch.randn(model_config.data.mel.n_mels, max_frames)
-        * model_config.conditioner.normalization_scale
-        + model_config.conditioner.normalization_shift
-    )
+    spectrogram = torch.randn(model_config.data.mel.n_mels, max_frames)
 
+    # Run inference at least once before benchmarking to reduce startup noise.
     print("Warming up...")
     model.infer([spectrogram[:, :warmup_frames]])
 

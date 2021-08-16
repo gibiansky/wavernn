@@ -1,5 +1,5 @@
 """
-Dataset-handling entrypoint for WaveRNN package.
+Dataset preparation and loading for WaveRNN.
 """
 import glob
 import json
@@ -17,309 +17,44 @@ from omegaconf import MISSING
 
 from wavernn.util import cmd, die_if, download
 
-# Public-facing dataset names.
-NAME_LJSPEECH: str = "ljspeech"
-
-# Where to store dataset information.
+# Where to store dataset information. A valid dataset, as far as this package
+# is concerned, is a directory with a dataset.json file in it which points to
+# WAV files stored inside that directory. See the list of required keys below.
 DATASET_JSON: str = "dataset.json"
 
-# Keys required in dataset.json
+# Keys required in dataset.json. Each of the keys delineates a subset of the
+# dataset as specified by a collection of globs. Globs are expanded using
+# Python's glob.glob() function inside the dataset directory. For example, a
+# reasonable data format would have a train/, validation/, and test/
+# subdirectory, in which case the dataset.json would look like this:
+#
+#     {
+#          "train": "train/*.wav",
+#          "valid": "validation/*.wav",
+#          "test": "test/*.wav"
+#     }
 TRAIN_KEY: str = "train"
 VALID_KEY: str = "valid"
 TEST_KEY: str = "test"
 
-# Dictionary mapping dataset to download URL.
+# Public-facing dataset names. These are used by the 'download' command.
+NAME_LJSPEECH: str = "ljspeech"
+
+# Dictionary mapping dataset to download URL. These datasets can be downloaded
+# with the 'download' command. For example, to download LJSpeech, you can run:
+#
+#     wavernn dataset download ljspeech --destination ~/ljspeech
+#
+# This will download and unpack the dataset into ~/ljspeech.
 DATASETS: dict[str, str] = {
     NAME_LJSPEECH: "https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2"
 }
 
 
-@dataclass
-class MelConfig:
-    """Configuration for log mel spectrogram extraction."""
-
-    # Sample rate of the audio. If the audio is not this sample rate, it will
-    # be up- or downsampled to this sample rate when it is loaded.
-    sample_rate: int = MISSING
-
-    # Number of Fourier coefficients in the spectrogram.
-    n_fft: int = MISSING
-
-    # Number of bands in the mel spectrogram.
-    n_mels: int = MISSING
-
-    # Minimum frequency to include in the mel spectrogram.
-    fmin: float = MISSING
-
-    # Maximum frequency to include in the mel spectrogram.
-    fmax: float = MISSING
-
-    # How many samples to shift between each consecutive frame.
-    hop_length: int = MISSING
-
-    # How many samples to include in the window used for STFT extraction.
-    win_length: int = MISSING
-
-    # Minimum spectrogram magnitude to enforce to avoid log underflow.
-    # Log mel spectrogram is ln(clip(mel_spectrogram, log_epsilon)).
-    log_epsilon: float = MISSING
-
-    # Pre-emphasis filter to apply to the waveform prior to feature extraction.
-    pre_emphasis: float = MISSING
-
-
-@dataclass
-class DataConfig:
-    """
-    Configuration for a training dataset.
-    """
-
-    # Path where to load the dataset.
-    path: str = MISSING
-
-    # Configuration for mel spectrogram extraction.
-    mel: MelConfig = MISSING
-
-    # How many frames to include in each audio sample.
-    # The number of audio samples is clip_frames * mel.hop_length.
-    clip_frames: int = MISSING
-
-    # How many frames of "padding" data to include in the spectrogram. Padding
-    # frames are included so that, if your sample starts at frame t, the data
-    # starts at frame t - padding_frames and ends at t + clip_frames + padding_frames.
-    # This allows a convolutional conditioning network to have proper data on
-    # the left and right edges, instead of zero-padding, which would make it so
-    # that the inference behavior differs from the training behavior. The
-    # padding frames are computed as if the data in the waveform was zeros.
-    padding_frames: int = MISSING
-
-    # How many samples to include in a batch.
-    batch_size: int = MISSING
-
-
-class AudioSample(NamedTuple):
-    """
-    A training sample.
-    """
-
-    # A float32 waveform tensor of shape [num_samples].
-    # After batching, the shape will be [batch_size, num_samples].
-    waveform: torch.Tensor
-
-    # A float32 mel spectrogram tensor of shape [n_mels, num_frames].
-    # After batching, the shape will be [batch_size, n_mels, num_frames].
-    spectrogram: torch.Tensor
-
-
-class AudioDataset(torch.utils.data.IterableDataset):
-    """
-    A dataset of audio waveforms and mel spectrograms.
-    """
-
-    def __init__(
-        self, globs: list[str], config: DataConfig, shuffle: bool = False
-    ) -> None:
-        """
-        Create a new dataset.
-
-        Args:
-          globs: The filename globs to use for the input data.
-          config: The dataset configuration.
-          shuffle: Whether to shuffle the files during iteration.
-            Should be set to True for the training dataset.
-        """
-        super().__init__()
-
-        self.config = config
-        self.shuffle = shuffle
-
-        # Collect all files in this dataset.
-        self.filenames: list[str] = []
-        for glb in globs:
-            self.filenames.extend(glob.glob(os.path.join(config.path, glb)))
-
-    def __iter__(self) -> Iterator[AudioSample]:
-        """
-        Iterate over this dataset.
-
-        Yields:
-          Audio samples containing mel spectrograms and waveforms.
-        """
-        # Split files by worker.
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is None:
-            filenames = self.filenames[:]
-        else:
-            filenames = [
-                filename
-                for i, filename in enumerate(self.filenames)
-                if i % worker_info.num_workers == worker_info.id  # type:ignore
-            ]
-
-        if self.shuffle:
-            random.shuffle(filenames)
-
-        for filename in filenames:
-            yield from self.load_samples_from(filename)
-
-    def load_samples_from(
-        self, filename: str, clip_frames: Optional[int] = None
-    ) -> Iterator[AudioSample]:
-        """
-        Load training samples from a file.
-
-        Args:
-          filename: Path to load from.
-          clip_frames: How many spectrogram frames to include in each clip.
-            If not provided, uses the default in the data configuration.
-
-        Yields:
-          All the training samples from a given file.
-        """
-        if clip_frames is None:
-            clip_frames = self.config.clip_frames
-
-        # Load waveform from disk.
-        mel = self.config.mel
-
-        raw_waveform: np.ndarray
-        sr: int
-        raw_waveform, sr = librosa.load(filename, sr=mel.sample_rate)
-
-        if mel.pre_emphasis > 0:
-            raw_waveform = librosa.effects.preemphasis(
-                raw_waveform, coef=mel.pre_emphasis
-            )
-
-        # Ensure samples are all in (-1, 1).
-        # This happens very rarely on raw audio but if you apply pre-emphasis
-        # then it happens to a small fraction (0.01% or less) of a small
-        # fraction (5-10%) of audio files.
-        raw_waveform = np.clip(raw_waveform, -0.9999999, 0.9999999)
-
-        # Pad waveform with silence at the end. Our spectrogram frames are
-        # non-centered, and we'd like the number of samples in the waveform to
-        # be exactly the hop length times the number of spectrogram frames. In
-        # order to do this, we compute the number of frames we want, then pad
-        # the waveform so that its length is equal to
-        #   waveform_length = (num_frames - 1) * hop_length + win_length
-        # (This assumes that win_length > hop_length.)
-        # Althought the final waveform length is as above, we want our
-        # spectrogram length to have extra padding frames on the left and
-        # right. In order to achieve this, we pad the waveform with zero
-        # samples equal to the number of desired padding frames.
-        assert mel.win_length >= mel.hop_length, "Window cannot be less than hop"
-        num_frames = (raw_waveform.size + mel.hop_length - 1) // mel.hop_length
-        needed_length = (num_frames - 1) * mel.hop_length + mel.win_length
-        padding_frames = self.config.padding_frames
-        padding_samples = padding_frames * mel.hop_length
-        padded_waveform = np.pad(
-            raw_waveform,
-            (padding_samples, padding_samples + needed_length - raw_waveform.size),
-        )
-        spectrogram: np.ndarray
-        spectrogram = librosa.feature.melspectrogram(
-            padded_waveform,
-            sr,
-            n_fft=mel.n_fft,
-            hop_length=mel.hop_length,
-            win_length=mel.win_length,
-            center=False,
-            n_mels=mel.n_mels,
-            fmin=mel.fmin,
-            fmax=mel.fmax,
-        )
-        log_epsilon = torch.tensor(mel.log_epsilon, dtype=torch.float32)
-        for i in range(0, spectrogram.shape[1], clip_frames):
-            desired_frames = clip_frames + 2 * padding_frames
-            clip_spectrogram = torch.from_numpy(spectrogram[:, i : i + desired_frames])
-            if clip_spectrogram.shape[1] != desired_frames:
-                continue
-
-            start_sample = (i + padding_frames) * mel.hop_length
-            end_sample = start_sample + clip_frames * mel.hop_length
-            clip_waveform = torch.from_numpy(padded_waveform[start_sample:end_sample])
-            log_spectrogram = torch.log(torch.maximum(clip_spectrogram, log_epsilon))
-            yield AudioSample(waveform=clip_waveform, spectrogram=log_spectrogram)
-
-
-class AudioDataModule(pl.LightningDataModule):
-    """
-    Data loading module for audio data.
-    """
-
-    def __init__(self, config: DataConfig) -> None:
-        """
-        Create a new data module.
-
-        Args:
-          config: Configuration for the data module.
-        """
-        super().__init__()
-        self.config = config
-
-        self.train_set: Optional[AudioDataset] = None
-        self.valid_set: Optional[AudioDataset] = None
-        self.test_set: Optional[AudioDataset] = None
-
-    def setup(self, stage: Optional[str] = None):
-        """
-        Set up this data module.
-
-        Args:
-          stage: Which stage to set up. If stage is None, set up all stages.
-            Stage can also be 'fit', 'validate', or 'test'.
-        """
-        if self.train_set is not None:
-            return
-
-        # Load the listing.
-        listing_path = os.path.join(self.config.path, DATASET_JSON)
-        with open(listing_path, "r") as handle:
-            listing = json.load(handle)
-
-        self.train_set = AudioDataset(listing[TRAIN_KEY], self.config, shuffle=True)
-        self.valid_set = AudioDataset(listing[VALID_KEY], self.config)
-        self.test_set = AudioDataset(listing[TEST_KEY], self.config)
-
-    def train_dataloader(self) -> torch.utils.data.DataLoader:
-        """Create a training data loader.
-
-        Returns:
-          A training data loader.
-        """
-        dset = self.train_set
-        assert dset is not None
-        return torch.utils.data.DataLoader(
-            dset, batch_size=self.config.batch_size, num_workers=16
-        )
-
-    def val_dataloader(self) -> torch.utils.data.DataLoader:
-        """Create a validation data loader.
-
-        Returns:
-          A validation data loader.
-        """
-        dset = self.valid_set
-        assert dset is not None
-        return torch.utils.data.DataLoader(
-            dset, batch_size=self.config.batch_size, num_workers=2
-        )
-
-    def test_dataloader(self) -> torch.utils.data.DataLoader:
-        """Create a test data loader.
-
-        Returns:
-          A test data loader.
-        """
-        dset = self.test_set
-        assert dset is not None
-        return torch.utils.data.DataLoader(dset, batch_size=self.config.batch_size)
-
-
 def download_ljspeech(destination: str) -> None:
     """
-    Download LJSpeech dataset.
+    Download and unpack LJSpeech dataset. Generate a dataset.json in the target
+    directory with a reasonable train / validation / test split.
 
     Args:
       destination: Where to download dataset to.
@@ -338,6 +73,7 @@ def download_ljspeech(destination: str) -> None:
     print("Removing compressed version...")
     os.unlink(path)
 
+    # Generate dataset.json with train / validation / test split.
     listing_path = os.path.join(destination, DATASET_JSON)
     with open(listing_path, "w") as handle:
         json.dump(
@@ -358,7 +94,13 @@ def download_ljspeech(destination: str) -> None:
 
 def verify_dataset(path: str) -> None:
     """
-    Check that a dataset is correctly formatted.
+    Check that a dataset is correctly formatted. A correctly formatted dataset
+    is a directory with a dataset.json file which contains keys for training,
+    validation, and testing datasets. The values are lists of globs referring
+    to WAV files; the different sets of files must not overlap and must not be
+    empty.
+
+    If an error is detected, a message is printed and we exit with an error code.
 
     Args:
       path: Path to the dataset.
@@ -425,3 +167,308 @@ def cmd_verify(path: str) -> None:  # pylint: disable=missing-param-doc
     Verify a dataset.
     """
     verify_dataset(path)
+
+
+@dataclass
+class MelConfig:
+    """Configuration for log mel spectrogram extraction."""
+
+    # Sample rate of the audio. If the audio is not this sample rate, it will
+    # be up- or downsampled to this sample rate when it is loaded.
+    sample_rate: int = MISSING
+
+    # Number of Fourier coefficients in the spectrogram. This must be greater
+    # than or equal to the window size specified by win_length.
+    n_fft: int = MISSING
+
+    # Number of bands in the mel spectrogram.
+    n_mels: int = MISSING
+
+    # Minimum frequency to include in the mel spectrogram.
+    # A reasonable value is 0 to include all frequencies in the audio.
+    fmin: float = MISSING
+
+    # Maximum frequency to include in the mel spectrogram.
+    # A reasonable value is sample_rate / 2 to include all frequencies in the audio.
+    fmax: float = MISSING
+
+    # How many samples to shift between each consecutive frame. This must be
+    # smaller than the window size specified by win_length. A reasonable value
+    # is 5 - 25 milliseconds, that is, sample_rate * 0.005 or sample_rate * 0.025.
+    hop_length: int = MISSING
+
+    # How many samples to include in the window used for STFT extraction. This
+    # must be greater than hop_length and a reasonable value is 2x or 4x hop_length.
+    win_length: int = MISSING
+
+    # Minimum spectrogram magnitude to enforce to avoid log underflow.
+    # Log mel spectrogram is ln(clip(mel_spectrogram, log_epsilon)).
+    # If a minimum value isn't enforced, then low-volume regions with a value
+    # of zero will become negative infinity.
+    log_epsilon: float = MISSING
+
+    # Coefficient for a pre-emphasis filter to apply to the waveform prior to feature extraction.
+    # A pre-emphasis filter replaces the signal x[t] with the modified signal x'[t]
+    #
+    #     x'[t] = x[t] - alpha * x[t - 1]
+    #
+    # Setting the coefficient value here to zero removes this filter. Setting
+    # it to a higher value (commonly 0.97, for instance) effectively boosts
+    # high frequencies in the training data. A de-emphasis (inverse of
+    # pre-emphasis) filter is applied to the synthesized data, which in turn
+    # attenuates high frequencies. Quantization noise is more audible in higher
+    # frequencies and thus pre-emphasis can reduce the audible impact of
+    # quantization noise.
+    pre_emphasis: float = MISSING
+
+
+@dataclass
+class DataConfig:
+    """
+    Configuration for a training dataset.
+    """
+
+    # Configuration for mel spectrogram extraction.
+    mel: MelConfig = MISSING
+
+    # How many spectrogram frames to include in each audio sample.
+    # The number of audio samples is clip_frames * mel.hop_length.
+    clip_frames: int = MISSING
+
+    # How many frames of "padding" data to include in the spectrogram. Padding
+    # frames are included so that, if your sample starts at frame t, the data
+    # starts at frame t - padding_frames and ends at t + clip_frames + padding_frames.
+    # This allows a convolutional conditioning network to have proper data on
+    # the left and right edges, instead of zero-padding, which would make it so
+    # that the inference behavior differs from the training behavior. The
+    # padding frames are computed as if the data in the waveform was zeros.
+    padding_frames: int = MISSING
+
+    # How many clips to include in a batch.
+    batch_size: int = MISSING
+
+
+class AudioSample(NamedTuple):
+    """
+    A training sample or a batch of training samples.
+    """
+
+    # A float32 waveform tensor of shape [num_samples].
+    # After batching, the shape will be [batch_size, num_samples].
+    waveform: torch.Tensor
+
+    # A float32 mel spectrogram tensor of shape [n_mels, num_frames].
+    # After batching, the shape will be [batch_size, n_mels, num_frames].
+    spectrogram: torch.Tensor
+
+
+class AudioDataset(torch.utils.data.IterableDataset):
+    """
+    An iterable PyTorch dataset of audio waveforms and mel spectrograms.
+    """
+
+    def __init__(
+        self, path: str, globs: list[str], config: DataConfig, shuffle: bool = False
+    ) -> None:
+        """
+        Create a new iterable dataset.
+
+        Args:
+          path: Path to the dataset directory.
+          globs: The filename globs to use for the input data.
+          config: The dataset configuration.
+          shuffle: Whether to shuffle the files during iteration.
+            Should be set to True for the training dataset.
+        """
+        super().__init__()
+
+        self.config = config
+        self.shuffle = shuffle
+
+        # Collect all files in this dataset.
+        self.filenames: list[str] = []
+        for glb in globs:
+            self.filenames.extend(glob.glob(os.path.join(path, glb)))
+
+    def __iter__(self) -> Iterator[AudioSample]:
+        """
+        Iterate over this dataset. If running with multiple data loading
+        workers, iterate over an even split of the dataset.
+
+        Yields:
+          Audio samples containing mel spectrograms and waveforms. A single
+          file will result in many generated samples, since each sample will be
+          split into non-overlapping clips as indicated by the 'clip_frames'
+          configuration value.
+        """
+        # Split files by worker.
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            filenames = self.filenames[:]
+        else:
+            filenames = [
+                filename
+                for i, filename in enumerate(self.filenames)
+                if i % worker_info.num_workers == worker_info.id  # type:ignore
+            ]
+
+        if self.shuffle:
+            random.shuffle(filenames)
+
+        for filename in filenames:
+            yield from self.load_samples_from(filename)
+
+    def load_samples_from(
+        self, filename: str, clip_frames: Optional[int] = None
+    ) -> Iterator[AudioSample]:
+        """
+        Load training samples from a file.
+
+        Args:
+          filename: Path to load from.
+          clip_frames: How many spectrogram frames to include in each clip.
+            If not provided, uses the default in the data configuration.
+            This option exists so that we can easily use this dataset to do data
+            loading for purposes besides training, such as copy-synthesis.
+
+        Yields:
+          The audio samples in a file and mel spectrograms extracted from them,
+          split into AudioSample tuples with 'clip_frames' spectrogram frames
+          in each sample.
+        """
+        mel = self.config.mel
+        if clip_frames is None:
+            clip_frames = self.config.clip_frames
+
+        # Load waveform from disk.
+        raw_waveform: np.ndarray
+        sr: int
+        raw_waveform, sr = librosa.load(filename, sr=mel.sample_rate)
+
+        if mel.pre_emphasis > 0:
+            raw_waveform = librosa.effects.preemphasis(
+                raw_waveform, coef=mel.pre_emphasis
+            )
+
+        # Ensure samples are all in (-1, 1).
+        # This happens very rarely on well-formatted raw audio but if you apply
+        # pre-emphasis then it happens to a small fraction (0.01% or less) of a
+        # small fraction (5-10%) of audio files.
+        raw_waveform = np.clip(raw_waveform, -0.9999999, 0.9999999)
+
+        # Pad waveform with silence at the start and end.
+        #
+        # Our spectrogram frames are non-centered, and we'd like the number of
+        # samples in the waveform to be exactly the hop length times the number
+        # of spectrogram frames we want our short-time Fourier transform to
+        # generate. In order to do this, we compute the number of frames we
+        # want, then pad the waveform so that its length is equal to
+        #
+        #   waveform_length = (num_frames - 1) * hop_length + win_length
+        #            (Assuming win_length > hop_length.)
+        #
+        # Additionally, we want our spectrogram length to have extra padding
+        # frames on the left and right. To achieve this we pad the waveform
+        # with zero samples equal to the number of desired padding frames.
+        assert mel.win_length >= mel.hop_length, "Window cannot be less than hop"
+        num_frames = (raw_waveform.size + mel.hop_length - 1) // mel.hop_length
+        needed_length = (num_frames - 1) * mel.hop_length + mel.win_length
+        padding_frames = self.config.padding_frames
+        padding_samples = padding_frames * mel.hop_length
+        padded_waveform = np.pad(
+            raw_waveform,
+            (padding_samples, padding_samples + needed_length - raw_waveform.size),
+        )
+        spectrogram: np.ndarray
+        spectrogram = librosa.feature.melspectrogram(
+            padded_waveform,
+            sr,
+            n_fft=mel.n_fft,
+            hop_length=mel.hop_length,
+            win_length=mel.win_length,
+            center=False,
+            n_mels=mel.n_mels,
+            fmin=mel.fmin,
+            fmax=mel.fmax,
+        )
+
+        # Compute the log mel spectrogram with a minimum value to avoid underflow.
+        log_epsilon = torch.tensor(mel.log_epsilon, dtype=torch.float32)
+        torch_spectrogram = torch.from_numpy(spectrogram)
+        log_spectrogram = torch.log(torch.maximum(torch_spectrogram, log_epsilon))
+
+        # Split the audio and spectrogram into chunks. Each chunk has
+        # 'clip_frames' spectrogram frames and the corresponding samples.
+        # Additionally, 'padding_frames' spectrogram frames are included on the
+        # left and right of the spectrogram; these padding frames overlap with
+        # the padding frames of previous and next generated chunks.
+        for i in range(0, spectrogram.shape[1], clip_frames):
+            desired_frames = clip_frames + 2 * padding_frames
+            clip_spectrogram = log_spectrogram[:, i : i + desired_frames]
+            if clip_spectrogram.shape[1] != desired_frames:
+                continue
+
+            start_sample = (i + padding_frames) * mel.hop_length
+            end_sample = start_sample + clip_frames * mel.hop_length
+            clip_waveform = torch.from_numpy(padded_waveform[start_sample:end_sample])
+            yield AudioSample(waveform=clip_waveform, spectrogram=clip_spectrogram)
+
+
+class AudioDataModule(pl.LightningDataModule):
+    """
+    PyTorch Lightning data module for audio data.
+    """
+
+    def __init__(self, path: str, config: DataConfig) -> None:
+        """
+        Create a new data module.
+
+        Args:
+          path: A path to the dataset directory.
+          config: Configuration for the data module.
+        """
+        super().__init__()
+
+        self.config = config
+
+        # Load the dataset and its splits.
+        listing_path = os.path.join(path, DATASET_JSON)
+        with open(listing_path, "r") as handle:
+            listing = json.load(handle)
+
+        self.train_set = AudioDataset(path, listing[TRAIN_KEY], config, shuffle=True)
+        self.valid_set = AudioDataset(path, listing[VALID_KEY], config)
+        self.test_set = AudioDataset(path, listing[TEST_KEY], config)
+
+    def train_dataloader(self) -> torch.utils.data.DataLoader:
+        """
+        Create a training data loader.
+
+        Returns:
+          A training data loader.
+        """
+        return torch.utils.data.DataLoader(
+            self.train_set, batch_size=self.config.batch_size, num_workers=16
+        )
+
+    def val_dataloader(self) -> torch.utils.data.DataLoader:
+        """
+        Create a validation data loader.
+
+        Returns:
+          A validation data loader.
+        """
+        return torch.utils.data.DataLoader(
+            self.valid_set, batch_size=self.config.batch_size, num_workers=8
+        )
+
+    def test_dataloader(self) -> torch.utils.data.DataLoader:
+        """
+        Create a test data loader.
+
+        Returns:
+          A test data loader.
+        """
+        return torch.utils.data.DataLoader(
+            self.test_set, batch_size=self.config.batch_size
+        )

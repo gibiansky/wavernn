@@ -6,6 +6,11 @@ black --check src
 echo 'Done.'
 echo
 
+echo 'Checking Python import order...'
+isort src --diff
+echo 'Done.'
+echo
+
 echo 'Checking C++ formatting...'
 clang-format --dry-run --Werror src/kernel/*.cpp
 echo 'Done.'

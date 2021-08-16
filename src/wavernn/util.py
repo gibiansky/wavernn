@@ -12,7 +12,7 @@ import tqdm  # type: ignore
 
 def download(url: str, target: str) -> str:
     """
-    Downloads a file.
+    Downloads a file while displaying a progress bar.
 
     Args:
       url: The URL of the file to download.
@@ -44,7 +44,9 @@ def download(url: str, target: str) -> str:
 
 def die_if(condition: bool, message: str) -> None:
     """
-    Die if a condition is met. Prints an error message.
+    Die if a condition is met.
+
+    If so, prints an error message and exits with a non-zero exit code.
 
     Args:
       condition: Condition for termination.
