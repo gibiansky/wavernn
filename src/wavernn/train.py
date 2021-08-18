@@ -45,7 +45,7 @@ BEST_CHECKPOINT: str = "best"
 @click.option(
     "--test-every", default=5000, help="How often to run validation during training"
 )
-@click.argument("overrides", multiple=True, help="Dotlist option overrides")
+@click.argument("overrides", nargs=-1)
 def train(  # pylint: disable=missing-param-doc
     config: Optional[str], path: str, data: str, test_every: int, overrides: list[str]
 ) -> None:

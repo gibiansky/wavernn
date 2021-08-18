@@ -39,6 +39,16 @@ TEST_KEY: str = "test"
 
 # Public-facing dataset names. These are used by the 'download' command.
 NAME_LJSPEECH: str = "ljspeech"
+NAME_VCTK: str = "vctk"
+NAME_LIBRITTS: str = "libritts"
+
+# List of LibriTTS subsets.
+LIBRITTS_CLEAN_CHUNKS: list[str] = [
+    "dev-clean.tar.gz",
+    "test-clean.tar.gz",
+    "train-clean-100.tar.gz",
+    "train-clean-360.tar.gz",
+]
 
 # Dictionary mapping dataset to download URL. These datasets can be downloaded
 # with the 'download' command. For example, to download LJSpeech, you can run:
@@ -47,7 +57,9 @@ NAME_LJSPEECH: str = "ljspeech"
 #
 # This will download and unpack the dataset into ~/ljspeech.
 DATASETS: dict[str, str] = {
-    NAME_LJSPEECH: "https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2"
+    NAME_LJSPEECH: "https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2",
+    NAME_VCTK: "http://www.udialogue.org/download/VCTK-Corpus.tar.gz",
+    NAME_LIBRITTS: "https://www.openslr.org/resources/60/",
 }
 
 
@@ -86,6 +98,130 @@ def download_ljspeech(destination: str) -> None:
                     "LJSpeech-1.1/wavs/LJ001-000*.wav",
                     "LJSpeech-1.1/wavs/LJ001-001*.wav",
                 ],
+            },
+            handle,
+            indent=2,
+        )
+
+
+def download_vctk(destination: str) -> None:
+    """
+    Download and unpack VCTK dataset. Generate a dataset.json in the target
+    directory with a reasonable train / validation / test split.
+
+    Args:
+      destination: Where to download dataset to.
+    """
+    if os.path.exists(destination):
+        is_empty_dir = os.path.isdir(destination) and len(os.listdir(destination)) == 0
+        die_if(not is_empty_dir, f"{destination} already exists")
+    else:
+        os.makedirs(destination)
+
+    path = download(DATASETS[NAME_VCTK], destination)
+
+    print("Extracting dataset (this may take a while)...")
+    cmd("tar", "--directory", destination, "-xf", path)
+
+    print("Removing compressed version...")
+    os.unlink(path)
+
+    # Generate dataset.json with train / validation / test split.
+    listing_path = os.path.join(destination, DATASET_JSON)
+    with open(listing_path, "w") as handle:
+        json.dump(
+            {
+                TRAIN_KEY: [
+                    f"VCTK-Corpus/wav48/*/*_{i:03d}.wav" for i in range(11, 503)
+                ],
+                VALID_KEY: [f"VCTK-Corpus/wav48/*/*_{i:03d}.wav" for i in range(4, 11)],
+                TEST_KEY: [
+                    "VCTK-Corpus/wav48/*/*_001.wav",
+                    "VCTK-Corpus/wav48/*/*_002.wav",
+                    "VCTK-Corpus/wav48/*/*_003.wav",
+                ],
+            },
+            handle,
+            indent=2,
+        )
+
+
+def download_libritts(destination: str) -> None:
+    """
+    Download and unpack the clean subsets of the LibriTTS dataset. Generate a dataset.json
+    in the target directory with a reasonable train / validation / test split.
+
+    Args:
+      destination: Where to download dataset to.
+    """
+    if os.path.exists(destination):
+        is_empty_dir = os.path.isdir(destination) and len(os.listdir(destination)) == 0
+        die_if(not is_empty_dir, f"{destination} already exists")
+    else:
+        os.makedirs(destination)
+
+    paths = [
+        download(os.path.join(DATASETS[NAME_LIBRITTS], chunk), destination)
+        for chunk in LIBRITTS_CLEAN_CHUNKS
+    ]
+
+    for chunk, path in zip(LIBRITTS_CLEAN_CHUNKS, paths):
+        print(f"Extracting dataset {chunk} (this may take a while)...")
+        cmd("tar", "--directory", destination, "-xf", path)
+
+        print(f"Removing compressed version of {chunk}...")
+        os.unlink(path)
+
+    # Collect all the speakers in LibriTTS.
+    speakers = []
+    for chunk in LIBRITTS_CLEAN_CHUNKS:
+        chunk = chunk.replace(".tar.gz", "")
+        speakers.extend(glob.glob(os.path.join(destination, "LibriTTS", chunk, "*")))
+
+    rand = random.Random(1234)
+    speakers.sort()
+    rand.shuffle(speakers)
+
+    # Check the number of speakers.
+    assert len(speakers) == 1230, f"Expected 1230 speakers, found {len(speakers)}"
+
+    # Speakers to use for testing (and not training) and speakers to use for
+    # training and/or validation. This is split to ensure there are some
+    # speakers that are never seen for training.
+    test_speakers = speakers[:10]
+    train_speakers = speakers[10:]
+
+    # Collect all known files.
+    seen_speaker_files = [
+        os.path.relpath(filename, destination)
+        for speaker_dir in train_speakers
+        for filename in glob.glob(os.path.join(speaker_dir, "*", "*.wav"))
+    ]
+    seen_speaker_files.sort()
+    rand.shuffle(seen_speaker_files)
+
+    # Add unseen speakers to test files.
+    test_globs = [
+        os.path.join(os.path.relpath(speaker_dir, destination), "*", "*.wav")
+        for speaker_dir in test_speakers
+    ]
+    test_globs.extend(seen_speaker_files[0:200])
+
+    valid_globs = seen_speaker_files[200:500]
+    train_globs = seen_speaker_files[500:]
+
+    test_globs.sort()
+    valid_globs.sort()
+    train_globs.sort()
+
+    # Generate dataset.json with train / validation / test split.
+    listing_path = os.path.join(destination, DATASET_JSON)
+    with open(listing_path, "w") as handle:
+        json.dump(
+            {
+                TRAIN_KEY: train_globs,
+                VALID_KEY: valid_globs,
+                TEST_KEY: test_globs,
             },
             handle,
             indent=2,
@@ -156,6 +292,10 @@ def cmd_download(  # pylint: disable=missing-param-doc
     """
     if name == NAME_LJSPEECH:
         download_ljspeech(destination)
+    elif name == NAME_VCTK:
+        download_vctk(destination)
+    elif name == NAME_LIBRITTS:
+        download_libritts(destination)
 
     verify_dataset(destination)
 
@@ -167,6 +307,15 @@ def cmd_verify(path: str) -> None:  # pylint: disable=missing-param-doc
     Verify a dataset.
     """
     verify_dataset(path)
+
+
+@dataset.command("list")
+def cmd_list() -> None:
+    """
+    List available datasets.
+    """
+    for dset in DATASETS:
+        print(dset)
 
 
 @dataclass

@@ -242,13 +242,21 @@ class DiscretizedMuLaw(torch.nn.Module):
         """
         if not waveform.is_floating_point():
             waveform = waveform.to(torch.float)
+
+        # Apply µ-law companding.
         mu = torch.tensor(self.mu, dtype=waveform.dtype)
         x_mu = (
             torch.sign(waveform)
             * torch.log1p(mu * torch.abs(waveform))
             / torch.log1p(mu)
         )
-        x_mu = ((x_mu + 1) / 2 * (self.buckets - 1) + 0.5).to(torch.int64)
+
+        # Quantize the resulting companded signal. If the number of buckets is
+        # even, then the quantization will be symmetric around zero, with one
+        # bucket being centered around zero.
+        assert self.buckets % 2 == 0, "Expected even number of buckets"
+        x_mu = ((x_mu + 1) / 2 * (self.buckets - 1)).to(torch.int64)
+
         return x_mu
 
     def dequantize(self, waveform: Tensor) -> Tensor:
@@ -262,8 +270,14 @@ class DiscretizedMuLaw(torch.nn.Module):
         """
         if not waveform.is_floating_point():
             waveform = waveform.to(torch.float)
+
+        # Dequantize the integer-valued signal. Since the middle bucket is
+        # centered around zero, we need to add 0.5 to the bucket boundary in
+        # order to properly treat zero. With this shift, zero can be quantized
+        # and dequantized without error.
+        x = ((waveform + 0.5) / (self.buckets - 1)) * 2 - 1.0
+
         mu = torch.tensor(self.mu, dtype=waveform.dtype)
-        x = (waveform / (self.buckets - 1)) * 2 - 1.0
         x = torch.sign(x) * (torch.exp(torch.abs(x) * torch.log1p(mu)) - 1.0) / mu
         return x
 

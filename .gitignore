@@ -135,6 +135,8 @@ lightning_logs
 
 # Known datasets
 ljspeech
+vctk
+libritts
 *.wav
 
 # Doxygen things
