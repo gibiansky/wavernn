@@ -7,11 +7,12 @@ from typing import List, Optional
 
 import click
 import pytorch_lightning as pl
+import torch
 from omegaconf import OmegaConf
 from pytorch_lightning.loggers import TensorBoardLogger
 
 from wavernn.dataset import AudioDataModule
-from wavernn.model import VALIDATION_LOSS_KEY, Config, Model
+from wavernn.model import VALIDATION_LOSS_KEY, Config, ExportableWaveRNN, Model
 from wavernn.util import die_if
 
 # Constants related to the model directory organization.
@@ -77,9 +78,9 @@ def train(  # pylint: disable=missing-param-doc
     # Load the dataset from the config.
     data_module = AudioDataModule(data, model_config.data)
 
-    best_path = os.path.join(path, CHECKPOINTS_DIR, BEST_CHECKPOINT + ".ckpt")
-    if os.path.exists(best_path):
-        model = Model.load_from_checkpoint(best_path, config=model_config)
+    last_path = os.path.join(path, CHECKPOINTS_DIR, "last.ckpt")
+    if os.path.exists(last_path):
+        model = Model.load_from_checkpoint(last_path, config=model_config)
     else:
         # If this model has never been initialized before, compute the input
         # stats from the dataset. The input stats are used for normalizing the
@@ -106,3 +107,31 @@ def train(  # pylint: disable=missing-param-doc
         gpus=1,
     )
     trainer.fit(model, data_module)
+
+
+@click.command("export")
+@click.option(
+    "--path", required=True, type=click.Path(file_okay=False), help="Model directory"
+)
+@click.option(
+    "--output",
+    required=True,
+    type=click.Path(dir_okay=False),
+    help="Path to export to",  # pylint: disable=missing-param-doc
+)
+def export(path: str, output: str) -> None:
+    """
+    Export a trained WaveRNN.
+    """
+    config = os.path.join(path, CONFIG_PATH)
+    die_if(not os.path.exists(config), f"Missing config file {config}")
+
+    last_path = os.path.join(path, CHECKPOINTS_DIR, "last.ckpt")
+    die_if(not os.path.exists(last_path), f"Missing checkpoint {last_path}")
+
+    model_config: Config = OmegaConf.structured(Config)
+    model_config.merge_with(OmegaConf.load(config))  # type: ignore
+    model = Model.load_from_checkpoint(last_path, config=model_config)
+
+    exported = torch.jit.script(ExportableWaveRNN(model))
+    exported.save(output)

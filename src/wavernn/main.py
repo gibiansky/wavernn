@@ -28,6 +28,7 @@ def main() -> None:
 
 main.add_command(wavernn.dataset.dataset)
 main.add_command(wavernn.train.train)
+main.add_command(wavernn.train.export)
 main.add_command(wavernn.infer.infer)
 main.add_command(wavernn.infer.benchmark)
 main.add_command(wavernn.infer.gemv)

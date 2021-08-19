@@ -1,16 +1,18 @@
 """
 WaveRNN model definition.
 """
+import os
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator, NamedTuple, Optional, Tuple
+from typing import Any, Iterable, Iterator, List, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 import pytorch_lightning as pl
+import scipy.signal  # type: ignore
 import torch
 from omegaconf import MISSING
 from torch import Tensor
 
-from wavernn.dataset import AudioSample, DataConfig
+from wavernn.dataset import AudioDataset, AudioSample, DataConfig, MelConfig
 from wavernn.prune import PruneConfig, prune
 from wavernn.util import die_if, load_extension_module
 
@@ -676,7 +678,9 @@ class Model(pl.LightningModule):
         hop_length = self.config.data.mel.hop_length
         weights = self.weights()
 
-        final_sample = torch.full((1,), 128, dtype=torch.int64)
+        final_sample = torch.full(
+            (1,), (self.config.output.buckets - 1) // 2, dtype=torch.int64
+        )
         final_state = torch.zeros((self.config.autoregressive.gru_dimension))
 
         sample_activations = torch.mm(
@@ -708,3 +712,216 @@ class Model(pl.LightningModule):
                     conditioning, final_sample, final_state
                 )
             yield self.domain.dequantize(samples).numpy()
+
+
+class ExportableWaveRNN(torch.nn.Module):
+    """
+    A WaveRNN exported for inference.
+    """
+
+    def __init__(self, train_wavernn: Model) -> None:
+        """
+        Create a new exportable WaveRNN.
+
+        Args:
+          train_wavernn: The trained WaveRNN model.
+        """
+        super().__init__()
+        load_extension_module()
+
+        config = train_wavernn.config
+        weights = train_wavernn.weights()
+
+        # Create the initial state used by this WaveRNN.
+        self.init_sample = torch.full(
+            (1,), (config.output.buckets - 1) // 2, dtype=torch.int64
+        )
+        self.init_state = torch.zeros((config.autoregressive.gru_dimension))
+
+        # Create the weights needed for autoregressive inference.
+        self.sample_activations = torch.mm(
+            weights.sample_embeddings, weights.gru_weight_ih.t()
+        )
+        self.gru_weight_hh = weights.gru_weight_hh
+        self.gru_bias_hh = weights.gru_bias_hh
+        self.hidden_weight = weights.hidden_weight
+        self.hidden_bias = weights.hidden_bias
+        self.output_weight = weights.output_weight
+        self.output_bias = weights.output_bias
+        self.hop_length = config.data.mel.hop_length
+        self.gru_bias_ih = weights.gru_bias_ih
+        self.gru_weight_ih_t = weights.gru_weight_ih.t()
+
+        self.conditioner = train_wavernn.conditioner
+        self.domain = train_wavernn.domain
+
+        # Store model input and output config information.
+        self.padding_frames = config.data.padding_frames
+        self.sample_rate = config.data.mel.sample_rate
+        self.n_fft = config.data.mel.n_fft
+        self.n_mels = config.data.mel.n_mels
+        self.fmin = config.data.mel.fmin
+        self.fmax = config.data.mel.fmax
+        self.hop_length = config.data.mel.hop_length
+        self.win_length = config.data.mel.win_length
+        self.log_epsilon = config.data.mel.log_epsilon
+        self.pre_emphasis = config.data.mel.pre_emphasis
+
+    @torch.jit.export
+    @torch.no_grad()
+    def synthesize(
+        self, spectrogram: Tensor, state: Optional[Tuple[Tensor, Tensor]]
+    ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
+        """
+        Run synthesis using the exported WaveRNN.
+
+        Args:
+          spectrogram: A spectrogram of shape [timesteps, n_mels].
+          state: If passed, the previous state of the WaveRNN.
+            State is a tuple of (final_sample, final_rnn_state).
+
+        Returns:
+          A tuple containing the synthesized data and the final state.
+        """
+        if state is None:
+            sample = self.init_sample.clone()
+            gru_state = self.init_state.clone()
+        else:
+            sample, gru_state = state
+
+        # Run conditioner network.
+        hidden = self.conditioner(spectrogram.unsqueeze(0))
+        conditioning = hidden.squeeze(0).transpose(0, 1)
+        activations_ih = torch.addmm(
+            self.gru_bias_ih, conditioning, self.gru_weight_ih_t
+        )
+
+        # Run autoregressive network.
+        output = torch.ops.wavernn.wavernn_inference(
+            activations_ih,
+            sample,
+            gru_state,
+            self.sample_activations,
+            self.gru_weight_hh,
+            self.gru_bias_hh,
+            self.hidden_weight,
+            self.hidden_bias,
+            self.output_weight,
+            self.output_bias,
+            self.hop_length,
+            False,
+        )
+        output = self.domain.dequantize(output)
+
+        return output, (sample, gru_state)
+
+
+class InferenceState(NamedTuple):
+    """
+    State needed during WaveRNN synthesis.
+    """
+
+    pre_emphasis_state: float
+    model_state: Optional[Tuple[Tensor, Tensor]]
+
+
+class InferenceWaveRNN:
+    """
+    A class capable of running inference with an exported WaveRNN.
+    """
+
+    def __init__(self, path: str, clip_frames: int) -> None:
+        """
+        Create a WaveRNN inference runner.
+
+        Args:
+          path: Path to an exported WaveRNN JIT file.
+          clip_frames: How many frames to synthesize in each step.
+        """
+        load_extension_module()
+
+        self.model = torch.jit.load(path)
+        self.sample_rate = self.model.sample_rate
+        self.data_config = DataConfig(
+            clip_frames=clip_frames,
+            padding_frames=self.model.padding_frames,
+            batch_size=1,
+            mel=MelConfig(
+                sample_rate=self.model.sample_rate,
+                n_fft=self.model.n_fft,
+                n_mels=self.model.n_mels,
+                fmin=self.model.fmin,
+                fmax=self.model.fmax,
+                hop_length=self.model.hop_length,
+                win_length=self.model.win_length,
+                log_epsilon=self.model.log_epsilon,
+                pre_emphasis=self.model.pre_emphasis,
+            ),
+        )
+
+    def load_clips_from_wav(self, input_file: str) -> List[AudioSample]:
+        """
+        Load a waveform from a WAV file and break it into clips.
+
+        Used for copy-synthesis testing of a trained WaveRNN.
+
+        Args:
+          input_file: Path to a .wav file to load.
+
+        Returns:
+          A list of audio samples. Each audio samples has a 'spectrogram' and
+          'waveform' field.
+        """
+        dataset = AudioDataset(
+            os.path.dirname(input_file),
+            [os.path.basename(input_file)],
+            self.data_config,
+        )
+        return list(dataset.load_samples_from(input_file))
+
+    @torch.no_grad()
+    def synthesize(
+        self,
+        spectrogram: Union[Tensor, np.ndarray],
+        state: Optional[InferenceState],
+    ) -> Tuple[np.ndarray, InferenceState]:
+        """
+        Run synthesis using this WaveRNN.
+
+        Args:
+          spectrogram: A spectrogram of shape [n_mels, timesteps].
+            Can be a PyTorch Tensor or a NumPy ndarray.
+          state: An optional state for the WaveRNN.
+            On first call, this should be left as None.
+
+        Returns:
+          A tuple containing the synthesized waveform and the state to pass to
+          the next call of 'synthesize'.
+        """
+        # Initialize empty state.
+        if state is None:
+            state = InferenceState(pre_emphasis_state=0.0, model_state=None)
+
+        # Convert spectrogram from NumPy to Torch if needed.
+        if isinstance(spectrogram, np.ndarray):
+            spectrogram = torch.from_numpy(spectrogram)
+
+        synthesized, model_state = self.model.synthesize(spectrogram, state.model_state)
+        waveform = synthesized.numpy()
+
+        # Implement our own de-emphasis to properly track state.
+        if self.model.pre_emphasis > 0:
+            waveform, pre_emphasis_state = scipy.signal.lfilter(
+                [1.0],
+                [1.0, -self.model.pre_emphasis],
+                waveform,
+                zi=[state.pre_emphasis_state],
+            )
+            pre_emphasis_state = pre_emphasis_state[0]
+        else:
+            pre_emphasis_state = 0.0
+
+        waveform = np.clip(waveform, -0.9999, 0.9999)
+        return waveform, InferenceState(
+            pre_emphasis_state=pre_emphasis_state, model_state=model_state
+        )

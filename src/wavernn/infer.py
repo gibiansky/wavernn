@@ -13,7 +13,7 @@ from omegaconf import OmegaConf
 from tqdm import tqdm  # type: ignore
 
 from wavernn.dataset import AudioDataset
-from wavernn.model import Config, Model
+from wavernn.model import Config, InferenceWaveRNN, Model
 from wavernn.prune import PruneConfig, prune
 from wavernn.train import CHECKPOINTS_DIR, CONFIG_PATH
 from wavernn.util import die_if, load_extension_module
@@ -25,7 +25,10 @@ INFERENCE_BAR_FMT: str = "{l_bar}{bar}| {n:.02f}/{total:.2f} [{rate_noinv_fmt}]"
 
 @click.command("infer")
 @click.option(
-    "--path", required=True, type=click.Path(file_okay=False), help="Model directory"
+    "--path",
+    required=True,
+    type=click.Path(exists=True),
+    help="Model directory or exported file",
 )
 @click.option(
     "--input",
@@ -47,6 +50,27 @@ def infer(  # pylint: disable=missing-param-doc
     """
     Run copy-synthesis inference with a WaveRNN.
     """
+    die_if(not input_file.endswith(".wav"), "--input argument must have .wav extension")
+    die_if(
+        not output_file.endswith(".wav"), "--output argument must have .wav extension"
+    )
+
+    if os.path.isdir(path):
+        infer_from_trained(path, input_file, output_file)
+    else:
+        infer_from_exported(path, input_file, output_file)
+
+
+def infer_from_trained(path: str, input_file: str, output_file: str) -> None:
+    """
+    Run copy-synthesis inference with a trained WaveRNN.
+
+    Args:
+      path: Path to the model directory.
+        This is the directory which contains config, checkpoints, logs, etc.
+      input_file: The path to an input WAV file to copy-synthesize.
+      output_file: Where to write the output WAV file to.
+    """
     config_path = os.path.join(path, CONFIG_PATH)
     checkpoint_path = os.path.join(path, CHECKPOINTS_DIR, "last.ckpt")
 
@@ -54,10 +78,6 @@ def infer(  # pylint: disable=missing-param-doc
     die_if(
         not os.path.exists(checkpoint_path),
         f"Missing checkpoint path {checkpoint_path}",
-    )
-    die_if(not input_file.endswith(".wav"), "--input argument must have .wav extension")
-    die_if(
-        not output_file.endswith(".wav"), "--output argument must have .wav extension"
     )
 
     # Create a model with the config.
@@ -90,6 +110,37 @@ def infer(  # pylint: disable=missing-param-doc
         waveform = librosa.effects.deemphasis(waveform, coef=mel.pre_emphasis)
         waveform = np.clip(waveform, -0.9999, 0.9999)
 
+    soundfile.write(output_file, waveform, sample_rate)
+
+
+def infer_from_exported(path: str, input_file: str, output_file: str) -> None:
+    """
+    Run copy-synthesis inference with a trained *and exported* WaveRNN.
+
+    Args:
+      path: Path to the exported model JIT file.
+      input_file: The path to an input WAV file to copy-synthesize.
+      output_file: Where to write the output WAV file to.
+    """
+    model = InferenceWaveRNN(path=path, clip_frames=10)
+    clips = model.load_clips_from_wav(input_file)
+
+    # Compute expected audio duration.
+    sample_rate = model.sample_rate
+    total_samples: int = sum(int(clip.waveform.numel()) for clip in clips)
+    total_secs = total_samples / sample_rate
+
+    # Synthesize with a nice progress bar.
+    synthesized_clips = []
+    with tqdm(total=total_secs, bar_format=INFERENCE_BAR_FMT, unit="sec") as progress:
+        state = None
+        for clip in clips:
+            synthesized, state = model.synthesize(clip.spectrogram, state)
+            synthesized_clips.append(synthesized)
+            progress.update(synthesized.size / sample_rate)
+
+    # If necessary, apply de-emphasis (inverse of pre-emphasis) to the signal.
+    waveform = np.concatenate(synthesized_clips)
     soundfile.write(output_file, waveform, sample_rate)
 
 

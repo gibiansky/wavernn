@@ -142,3 +142,4 @@ libritts
 # Doxygen things
 src/kernel/docs
 *.gif
+*.jit

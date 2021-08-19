@@ -92,7 +92,7 @@ $ wavernn export --path runs/my-model --output my-exported-model.jit
 
 You can now use `my-exported-model.jit` along with the library API described
 below to build custom applications (including full TTS engines) using your
-exported WaveRNN. 
+exported WaveRNN.
 
 ## Library Usage
 
@@ -104,19 +104,35 @@ To do so, export your model with the `export` command:
 $ wavernn export --path /path/to/my/model --output /path/to/exported/model.jit
 ```
 
-From Python, you can load this model as follows:
+From Python, you can load and use this model as follows:
 
 ```python
 # Import the package.
+import numpy
 import wavernn
 
 # Load the exported WaveRNN.
 model = wavernn.load("/path/to/exported/model.jit")
 
 # Create a test spectrogram with 50 frames.
-import numpy
-spectrogram = numpy.random.random((50, 80))
+# (In practice, you need a real spectrogram, not random noise.)
+n_mels = 80
+n_timesteps = 50
+spectrogram = numpy.random.random((n_mels, n_timesteps))
 
 # Synthesize an audio clip.
 waveform, state = model.synthesize(spectrogram, state=None)
+```
+
+## Citing
+
+If you use this work in your research, please cite:
+
+```
+@misc{GibianskyWaveRNN,
+  author = {Andrew Gibiansky},
+  title = {Andrew's WaveRNN},
+  year = {2021},
+  howpublished = {\url{https://github.com/gibiansky/wavernn}}
+}
 ```
