@@ -12,7 +12,7 @@ from torch import Tensor
 
 from wavernn.dataset import AudioSample, DataConfig
 from wavernn.prune import PruneConfig, prune
-from wavernn.util import die_if
+from wavernn.util import die_if, load_extension_module
 
 # Key under which to log validation loss.
 VALIDATION_LOSS_KEY: str = "validation_loss"
@@ -670,7 +670,7 @@ class Model(pl.LightningModule):
           are of shape [num_samples] and are float32 in the range [-1, 1].
         """
         # Ensure the C++ library is loaded.
-        torch.ops.load_library("build/lib.linux-x86_64-3.9/wavernn_kernel.so")
+        load_extension_module()
 
         # Extract hyperparameters and weights from the model.
         hop_length = self.config.data.mel.hop_length

@@ -1,12 +1,14 @@
 """
 Utility functions for WaveRNN.
 """
+import importlib
 import os
 import shlex
 import subprocess
 import sys
 
 import requests
+import torch
 import tqdm  # type: ignore
 
 
@@ -66,3 +68,25 @@ def cmd(*args: str) -> None:
     """
     print(f"Running command '{shlex.join(args)}' ...")
     subprocess.check_output(args)
+
+
+def load_extension_module() -> None:
+    """
+    Load the C++ extension module.
+
+    We use setuptools to build the extension module. Normally, a C++ extension
+    called 'x' built with setuptools can be loaded by just using 'import x';
+    however, the PyTorch extension modules which define new ops don't actually
+    define a valid Python module. (They don't have a PyInit_module_whatever
+    function in them.)
+
+    Instead of doing 'import x', we use the Python import machinery to find the
+    op, but then we import it using PyTorch's shared object loader.
+    """
+    # Find the shared object using Python's standard import machinery.
+    spec = importlib.util.find_spec("wavernn_kernel")
+    assert spec is not None, "Could not import WaveRNN C++ kernel"
+    path = spec.origin
+
+    # Load it into this process.
+    torch.ops.load_library(path)

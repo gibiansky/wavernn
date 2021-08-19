@@ -16,7 +16,7 @@ from wavernn.dataset import AudioDataset
 from wavernn.model import Config, Model
 from wavernn.prune import PruneConfig, prune
 from wavernn.train import CHECKPOINTS_DIR, CONFIG_PATH
-from wavernn.util import die_if
+from wavernn.util import die_if, load_extension_module
 
 # Format string for tqdm progress bar used during audio synthesis with the
 # 'infer' command. Provides slightly more meaningful units than the default.
@@ -198,7 +198,7 @@ def gemv(  # pylint: disable=missing-param-doc
     expected = torch.addmv(bias, matrix, vector)
 
     # Run the optimized kernel op.
-    torch.ops.load_library("build/lib.linux-x86_64-3.9/wavernn_kernel.so")
+    load_extension_module()
     output = torch.ops.wavernn.sparse_gemv(bias, matrix, vector)
 
     if not torch.allclose(expected, output, atol=1e-5):
