@@ -3,7 +3,7 @@ Training entrypoint for WaveRNN.
 """
 import os
 import shutil
-from typing import Optional
+from typing import List, Optional
 
 import click
 import pytorch_lightning as pl
@@ -47,7 +47,7 @@ BEST_CHECKPOINT: str = "best"
 )
 @click.argument("overrides", nargs=-1)
 def train(  # pylint: disable=missing-param-doc
-    config: Optional[str], path: str, data: str, test_every: int, overrides: list[str]
+    config: Optional[str], path: str, data: str, test_every: int, overrides: List[str]
 ) -> None:
     """
     Train a WaveRNN.

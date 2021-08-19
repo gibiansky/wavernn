@@ -2,7 +2,7 @@
 Pruning utilities for WaveRNN training.
 """
 from dataclasses import dataclass
-from typing import Tuple
+from typing import List, Tuple
 
 import torch
 from omegaconf import MISSING
@@ -57,7 +57,7 @@ def prune_fraction(step: int, config: PruneConfig) -> float:
 
 
 @torch.no_grad()
-def prune(config: PruneConfig, parameters: list[torch.Tensor], step: int) -> None:
+def prune(config: PruneConfig, parameters: List[torch.Tensor], step: int) -> None:
     """
     Prune parameters according to the provided configuration and update them
     in-place.

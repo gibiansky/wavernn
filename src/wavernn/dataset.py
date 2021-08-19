@@ -6,7 +6,7 @@ import json
 import os
 import random
 from dataclasses import dataclass
-from typing import Iterator, NamedTuple, Optional
+from typing import Dict, Iterator, List, NamedTuple, Optional
 
 import click
 import librosa  # type: ignore
@@ -43,7 +43,7 @@ NAME_VCTK: str = "vctk"
 NAME_LIBRITTS: str = "libritts"
 
 # List of LibriTTS subsets.
-LIBRITTS_CLEAN_CHUNKS: list[str] = [
+LIBRITTS_CLEAN_CHUNKS: List[str] = [
     "dev-clean.tar.gz",
     "test-clean.tar.gz",
     "train-clean-100.tar.gz",
@@ -56,7 +56,7 @@ LIBRITTS_CLEAN_CHUNKS: list[str] = [
 #     wavernn dataset download ljspeech --destination ~/ljspeech
 #
 # This will download and unpack the dataset into ~/ljspeech.
-DATASETS: dict[str, str] = {
+DATASETS: Dict[str, str] = {
     NAME_LJSPEECH: "https://data.keithito.com/data/speech/LJSpeech-1.1.tar.bz2",
     NAME_VCTK: "http://www.udialogue.org/download/VCTK-Corpus.tar.gz",
     NAME_LIBRITTS: "https://www.openslr.org/resources/60/",
@@ -417,7 +417,7 @@ class AudioDataset(torch.utils.data.IterableDataset):
     """
 
     def __init__(
-        self, path: str, globs: list[str], config: DataConfig, shuffle: bool = False
+        self, path: str, globs: List[str], config: DataConfig, shuffle: bool = False
     ) -> None:
         """
         Create a new iterable dataset.
@@ -435,7 +435,7 @@ class AudioDataset(torch.utils.data.IterableDataset):
         self.shuffle = shuffle
 
         # Collect all files in this dataset.
-        self.filenames: list[str] = []
+        self.filenames: List[str] = []
         for glb in globs:
             self.filenames.extend(glob.glob(os.path.join(path, glb)))
 

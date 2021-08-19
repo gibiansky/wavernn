@@ -61,7 +61,7 @@ class Conditioner(torch.nn.Module):
         """
         super().__init__()
 
-        layers: list[torch.nn.Module] = []
+        layers: List[torch.nn.Module] = []
         for idx in range(config.layers):
             input_channels = n_mels if idx == 0 else config.channels
             layers.extend(
@@ -343,7 +343,7 @@ class OptimizerConfig:
     decay_rate: float = MISSING
 
     # When to decay the learning rate. Measured in number of iterations.
-    decay_iterations: list[float] = MISSING
+    decay_iterations: List[float] = MISSING
 
 
 @dataclass
