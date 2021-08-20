@@ -1,7 +1,7 @@
 #include "ops.h"
 
 #include <immintrin.h>
-#include <mkl/mkl.h>
+#include <mkl.h>
 #include <torch/script.h>
 
 #include <random>

@@ -45,7 +45,8 @@ setuptools.setup(
                 "src/kernel/timer.cpp",
             ],
             libraries=["mkl_rt"],
-            extra_compile_args=["-ffast-math", "-march=native", "-fopenmp"],
+            extra_compile_args=["-ffast-math", "-march=native", "-fopenmp", "-I/opt/intel/mkl/include", "-I/usr/include/mkl"],
+            extra_link_args=["-L/opt/intel/mkl/lib/intel64/"],
         )
     ],
     cmdclass={"build_ext": BuildExtension.with_options(no_python_abi_suffix=True)},

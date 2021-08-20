@@ -2,7 +2,7 @@
 #include "gemv.h"
 
 #include <immintrin.h>
-#include <mkl/mkl.h>
+#include <mkl.h>
 #include <omp.h>
 #include <torch/script.h>
 
