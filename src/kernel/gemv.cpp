@@ -8,7 +8,12 @@
 
 #include "wavernn_assert.h"
 
+
+#if defined(__AVX512F__)
+constexpr int BLOCK_SIZE = 16;
+#else
 constexpr int BLOCK_SIZE = 8;
+#endif
 
 using torch::Tensor;
 
@@ -21,7 +26,101 @@ void gemv(Tensor& out, const Tensor& bias, const Tensor& matrix,
 
 }  // namespace wavernn::fallback
 
-#ifdef __AVX2__
+#if defined(__AVX512F__)
+namespace wavernn::avx512 {
+/**
+ * Compute a sparse matrix-vector multiply.
+ *
+ * @param output_size The number of output rows in this gemv.
+ * @param output Where to write the output (dense float32 vector).
+ * @param input Where to read the input data from (dense float32 vector).
+ * @param weights Packed weights.
+ * @param bias The bias vector (dense float32 vector).
+ * @param blocksPerRow Number of blocks involved in each row multiply.
+ * @param rowOffsets The offset in the weights for the nth row.
+ * @param indices The indices in the input vector to load blocks from.
+ */
+void sparse_gemv(int output_size, float* const __restrict__ output,
+                 const float* const __restrict__ input,
+                 const float* const __restrict__ weights,
+                 const float* const __restrict__ bias,
+                 const int* const __restrict__ blocksPerRow,
+                 const int* const __restrict__ rowOffsets,
+                 const int* const __restrict__ indices) {
+  // Parallelize the computation across the output row. Each thread can
+  // separately compute outputs for a block of the output vector.
+#pragma omp parallel for
+  for (int output_idx = 0; output_idx < output_size; output_idx++) {
+    // Number of block multiplications for this row.
+    int n_blocks = blocksPerRow[output_idx];
+
+    // Where the weights for this row start.
+    const float* block_weights = weights + rowOffsets[output_idx];
+
+    // Where the input indices for this row start.
+    const int* block_indices = indices + rowOffsets[output_idx] / BLOCK_SIZE;
+
+    // Unroll the block multiplication loop by 4. This speeds up the gemvs by a
+    // little bit. If the number of blocks is not a multiple of 4, the follow-up
+    // loop will take care of it.
+    int block_idx = 0;
+    int n_blocks_grouped = n_blocks - (n_blocks % 4);
+    __m512 sum_vec_0 = _mm512_set1_ps(0);
+    __m512 sum_vec_1 = sum_vec_0;
+    __m512 sum_vec_2 = sum_vec_0;
+    __m512 sum_vec_3 = sum_vec_0;
+    for (; block_idx < n_blocks_grouped; block_idx += 4) {
+      // Load the index of each block of the input.
+      int input_idx_0 = block_indices[block_idx + 0];
+      int input_idx_1 = block_indices[block_idx + 1];
+      int input_idx_2 = block_indices[block_idx + 2];
+      int input_idx_3 = block_indices[block_idx + 3];
+
+      // Load the data for the 4 input blocks.
+      __m512 input_vec_0 = _mm512_loadu_ps(input + input_idx_0);
+      __m512 input_vec_1 = _mm512_loadu_ps(input + input_idx_1);
+      __m512 input_vec_2 = _mm512_loadu_ps(input + input_idx_2);
+      __m512 input_vec_3 = _mm512_loadu_ps(input + input_idx_3);
+
+      // Load the data for the 4 weight blocks.
+      __m512 weight_vec_0 =
+          _mm512_loadu_ps(block_weights + (block_idx + 0) * BLOCK_SIZE);
+      __m512 weight_vec_1 =
+          _mm512_loadu_ps(block_weights + (block_idx + 2) * BLOCK_SIZE);
+      __m512 weight_vec_2 =
+          _mm512_loadu_ps(block_weights + (block_idx + 2) * BLOCK_SIZE);
+      __m512 weight_vec_3 =
+          _mm512_loadu_ps(block_weights + (block_idx + 3) * BLOCK_SIZE);
+
+      // Perform multiplications and accumulate into the accumulators.
+      sum_vec_0 = _mm512_fmadd_ps(input_vec_0, weight_vec_0, sum_vec_0);
+      sum_vec_1 = _mm512_fmadd_ps(input_vec_1, weight_vec_1, sum_vec_1);
+      sum_vec_2 = _mm512_fmadd_ps(input_vec_2, weight_vec_2, sum_vec_2);
+      sum_vec_3 = _mm512_fmadd_ps(input_vec_3, weight_vec_3, sum_vec_3);
+    }
+
+    // Sum up accumulators to get an accumulator for the follow-up loop.
+    __m512 sum_vec = _mm512_add_ps(_mm512_add_ps(sum_vec_0, sum_vec_1),
+                                   _mm512_add_ps(sum_vec_2, sum_vec_3));
+    for (; block_idx < n_blocks; block_idx++) {
+      // Load the input block.
+      __m512 input_vec = _mm512_loadu_ps(input + block_indices[block_idx]);
+
+      // Load the weight block.
+      __m512 weight_vec =
+          _mm512_loadu_ps(block_weights + block_idx * BLOCK_SIZE);
+
+      // Multiply and accumulate.
+      sum_vec = _mm512_fmadd_ps(input_vec, weight_vec, sum_vec);
+    }
+
+    // Compute the horizontal sum, add in the bias, and write to the output.
+    output[output_idx] = bias[output_idx] + _mm512_reduce_add_ps(sum_vec);
+  }
+}
+
+}  // namespace wavernn::avx512
+#elif defined(__AVX2__)
 namespace wavernn::avx2 {
 
 /// Sum up the values in an AVX 256-bit XMM register and return them as a float.
@@ -195,7 +294,17 @@ PackedLinear::PackedLinear(const Tensor& matrix, const Tensor& bias)
 void PackedLinear::gemv(Tensor& out, const Tensor& vector) const {
   ASSERT_TENSOR_SIZE(out, output_size_);
   ASSERT_TENSOR_SIZE(vector, input_size_);
-#ifdef __AVX2__
+#if defined(__AVX512F__)
+  float* const __restrict__ output = out.data_ptr<float>();
+  const float* const __restrict__ input = vector.data_ptr<float>();
+  const float* const __restrict__ weights = data_.data();
+  const float* const __restrict__ bias = bias_.data_ptr<float>();
+  const int* const __restrict__ blocksPerRow = blocksPerRow_.data();
+  const int* const __restrict__ rowOffsets = rowOffsets_.data();
+  const int* const __restrict__ indices = indices_.data();
+  wavernn::avx512::sparse_gemv(output_size_, output, input, weights, bias,
+                               blocksPerRow, rowOffsets, indices);
+#elif defined(__AVX2__)
   float* const __restrict__ output = out.data_ptr<float>();
   const float* const __restrict__ input = vector.data_ptr<float>();
   const float* const __restrict__ weights = data_.data();
