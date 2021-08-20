@@ -24,10 +24,10 @@ autoregressive:
   hidden_dimension: 1024
 
 prune:
-  final_sparsity: 0.8
+  final_sparsity: 0.7
   start_iteration: 100000
   stop_iteration: 500000
-  block: [1, 16]
+  block: [1, 32]
 
 output:
   buckets: 256
