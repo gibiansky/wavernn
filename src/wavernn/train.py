@@ -81,6 +81,7 @@ def train(  # pylint: disable=missing-param-doc
     last_path = os.path.join(path, CHECKPOINTS_DIR, "last.ckpt")
     if os.path.exists(last_path):
         model = Model.load_from_checkpoint(last_path, config=model_config)
+        resume_from: Optional[str] = last_path
     else:
         # If this model has never been initialized before, compute the input
         # stats from the dataset. The input stats are used for normalizing the
@@ -90,8 +91,11 @@ def train(  # pylint: disable=missing-param-doc
         model = Model(model_config)
         data_module.setup()
         model.initialize_input_stats(data_module.train_dataloader())
+        resume_from = None
 
-    # Train the model.
+    # Train the model. Even though we have loaded the model already, we still
+    # need to resume from the last checkpoint, otherwise global_step isn't
+    # correctly set.
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         monitor=VALIDATION_LOSS_KEY,
         dirpath=os.path.join(path, CHECKPOINTS_DIR),
@@ -101,6 +105,7 @@ def train(  # pylint: disable=missing-param-doc
     )
     logger = TensorBoardLogger(save_dir=path, version="logs", name=None)
     trainer = pl.Trainer(
+        resume_from_checkpoint=resume_from,
         callbacks=[checkpoint_callback],
         val_check_interval=test_every,
         logger=logger,

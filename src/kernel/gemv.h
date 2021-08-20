@@ -30,7 +30,10 @@ class PackedLinear {
   /// block-sparse matrix with sparsity >= 50%.
   /// @param matrix The float32 matrix of shape [output_size, input_size].
   /// @param bias The float32 bias vector of shape [output_size].
-  PackedLinear(const torch::Tensor& matrix, const torch::Tensor& bias);
+  /// @param quantize If true, use quantized kernels automatically when
+  /// possible.
+  PackedLinear(const torch::Tensor& matrix, const torch::Tensor& bias,
+               bool quantized = true);
 
   /// Multiply a vector by this matrix.
   /// @param out Output float32 tensor of shape [output_size].
@@ -38,11 +41,16 @@ class PackedLinear {
   void gemv(torch::Tensor& out, const torch::Tensor& vector) const;
 
  private:
+  /// Whether quantized kernels should be used when possible.
+  bool quantized_;
+
   /// The output size of the matrix.
   int output_size_;
 
   /// The input size of the matrix.
   int input_size_;
+
+  // Data for float32 multiplication.
 
   /// The packed float32 weight data.
   std::vector<float> data_;
@@ -64,6 +72,25 @@ class PackedLinear {
 
   /// The bias tensor of size [output_size].
   const torch::Tensor& bias_;
+
+  // Data for int16 multiplication.
+
+  /// The packed int16 weight data.
+  std::vector<int16_t> quantizedData_;
+
+  /// The number of non-zero input blocks for each output block.
+  std::vector<int> quantizedBlocksPerRow_;
+
+  /// The offset in the weight data for each row's blocks.
+  /// This is stored explicitly so that multithreaded gemv does not need to
+  /// compute where to start reading data for each thread.
+  std::vector<int> quantizedRowOffsets_;
+
+  /// The input vector indices which each block should be multiplied by.
+  std::vector<int> quantizedIndices_;
+
+  /// The float scales for each row.
+  std::vector<float> quantizedRowScales_;
 };
 
 }  // namespace wavernn
