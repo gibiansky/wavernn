@@ -28,7 +28,7 @@ appropriate environment or virtualenv.
 First, install MKL, which is needed to build the extension modules. You can
 follow the installation instructions
 [here](https://software.intel.com/content/www/us/en/develop/articles/installation-guide-for-intel-oneapi-toolkits.html).
-Alternatively, on Ubuntu, you can easily install from a package manager:
+On Ubuntu 20.04 or later, you can easily install from a package manager:
 ```
 $ sudo apt install libmkl-dev
 ```

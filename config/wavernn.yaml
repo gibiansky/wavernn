@@ -1,6 +1,5 @@
 # Config for baseline WaveRNN.
 data:
-  path: ljspeech
   clip_frames: 3
   padding_frames: 6
   batch_size: 64
@@ -25,7 +24,7 @@ autoregressive:
   hidden_dimension: 512
 
 prune:
-  final_sparsity: 0.0
+  final_sparsity: 0.9
   start_iteration: 100000
   stop_iteration: 500000
   block: [8, 8]

@@ -27,6 +27,13 @@ setuptools.setup(
     package_dir={"": "src"},
     packages=setuptools.find_packages(where="src"),
     python_requires=">=3.6",
+    install_requires=[
+        "click==8.0.1",
+        "omegaconf==2.1.0",
+        "torch==1.9.0",
+        "pytorch-lightning==1.4.1",
+        "librosa==0.8.1",
+    ],
     scripts=["scripts/wavernn"],
     ext_modules=[
         CppExtension(
