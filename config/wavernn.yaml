@@ -24,7 +24,7 @@ autoregressive:
   hidden_dimension: 1024
 
 prune:
-  final_sparsity: 0.9
+  final_sparsity: 0.94
   start_iteration: 100000
   stop_iteration: 500000
   block: [1, 8]

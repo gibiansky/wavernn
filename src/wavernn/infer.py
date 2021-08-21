@@ -192,7 +192,7 @@ def benchmark(  # pylint: disable=missing-param-doc
 
     # Run inference at least once before benchmarking to reduce startup noise.
     print("Warming up...")
-    model.infer([spectrogram[:, :warmup_frames]])
+    next(model.infer([spectrogram[:, :warmup_frames]]))
 
     print("Benchmarking...")
     start_time = time.time()

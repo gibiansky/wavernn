@@ -74,6 +74,64 @@ int SampleFromSoftmax(const Tensor &distribution) {
   return dim - 1;
 }
 
+/**
+ * Sample from a categorical distribution defined by the pre-softmax logits.
+ *
+ * This is done using the Gumbel-Softmax trick.
+ *
+ * @param distribution Logits of shape [num_classes]..
+ * @returns A sampled discrete value in the range [0, num_classes - 1].
+ */
+int SampleFromLogits(const Tensor &logits) {
+  // In order to make this function incredibly fast (since it may be in a tight
+  // inner loop), we will precompute a large quantity of random values and cycle
+  // through them. If the amount of random values is large enough, this will not
+  // be audible in the generated audio. The random values are populated from a
+  // random number generator the first time this function is called, so the very
+  // first call to this function will be much, much slower than all the
+  // subsequent calls.
+
+  // A static buffer of random values to cycle through.
+  static std::vector<float> random;
+
+  // The current index of the next random value to generate.
+  static size_t idx = 0;
+
+  // Fill the random value buffer the first time this is used.
+  if (random.empty()) {
+    random.resize(256 * 50000);
+
+    std::default_random_engine generator;  // NOLINT
+    std::uniform_real_distribution<double> distribution(0.0, 1.0);
+
+    for (float &flt : random) {
+      flt = -std::log(-std::log(distribution(generator)));
+    }
+  }
+
+  const float *lgts = logits.data_ptr<float>();
+  const float *randoms = random.data();
+  int dim = logits.size(0);
+
+  // Reset to start if needed.
+  if (idx + dim >= random.size()) {
+    idx = 0;
+  }
+
+  float maxVal = -9999.9f;
+  int maxIdx = 0;
+  for (int i = 0; i < dim; i++) {
+    float val = lgts[i] + randoms[idx + i];
+    if (val > maxVal) {
+      maxVal = val;
+      maxIdx = i;
+    }
+  }
+
+  idx += dim;
+  return maxIdx;
+}
+
 }  // namespace
 
 namespace wavernn {
@@ -170,8 +228,13 @@ inline __m256 _mm256_sigmoid_ps(__m256 x) {
 #endif
 
 int SoftmaxSampleFromLogits(const torch::Tensor &logits) {
-  auto distribution = at::softmax(logits, 0);
-  return SampleFromSoftmax(distribution);
+  // To sample without the Gumbel-Softmax trick...
+  //
+  //     auto distribution = at::softmax(logits, 0);
+  //     return SampleFromSoftmax(distribution);
+  //
+  // Sampling using Gumbel-Softmax trick is faster.
+  return SampleFromLogits(logits);
 }
 
 void UpdateGruState(const torch::Tensor &gruState, const torch::Tensor &gruIh,
