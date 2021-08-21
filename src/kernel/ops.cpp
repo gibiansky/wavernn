@@ -183,7 +183,6 @@ void UpdateGruState(const torch::Tensor &gruState, const torch::Tensor &gruIh,
 
 #if defined(__AVX2__)
   // AVX2 implementation.
-#if 1
   ASSERT_BOOL(size % 8 == 0);
 
   for (int i = 0; i < size; i += 8) {
@@ -204,35 +203,6 @@ void UpdateGruState(const torch::Tensor &gruState, const torch::Tensor &gruIh,
     __m256 s_new = _mm256_add_ps(_mm256_mul_ps(z1m, n), _mm256_mul_ps(s, z));
     _mm256_storeu_ps(state + i, s_new);
   }
-#else
-  vsAdd(2 * size, ih, hh, ih);
-
-#pragma omp simd
-  for (int i = 0; i < 2 * size; i++) {
-    ih[i] = -ih[i];
-  }
-
-  vsExp(2 * size, ih, ih);
-
-#pragma omp simd
-  for (int i = 0; i < 2 * size; i++) {
-    ih[i]++;
-  }
-
-  // 14%
-  vsInv(2 * size, ih, ih);
-  vsMul(size, ih, hh + 2 * size, hh + 2 * size);
-  vsAdd(size, ih + 2 * size, hh + 2 * size, ih + 2 * size);
-  vsTanh(size, ih + 2 * size, ih + 2 * size);
-
-  float *z = ih + size;
-  float *n = ih + 2 * size;
-#pragma omp simd
-  for (int i = 0; i < size; i++) {
-    state[i] = (1 - z[i]) * n[i] + z[i] * state[i];
-  }
-#endif
-
 #else
   // Fallback implementation.
 #pragma omp parallel for
