@@ -1,11 +1,18 @@
 #include "ops.h"
 
+#if defined(__AVX2__)
 #include <immintrin.h>
 #include <mkl.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include <torch/script.h>
 
 #include <random>
 #include <vector>
+
+#include "wavernn_assert.h"
 
 using torch::Tensor;
 
@@ -83,6 +90,7 @@ void UpdateGruState(const torch::Tensor &gruState, const torch::Tensor &gruIh,
   float *hh = gruHh.data_ptr<float>();
   float *state = gruState.data_ptr<float>();
 
+#if defined(__AVX2__)
   vsAdd(2 * size, ih, hh, ih);
 
 #pragma omp simd
@@ -102,6 +110,17 @@ void UpdateGruState(const torch::Tensor &gruState, const torch::Tensor &gruIh,
   vsMul(size, ih, hh + 2 * size, hh + 2 * size);
   vsAdd(size, ih + 2 * size, hh + 2 * size, ih + 2 * size);
   vsTanh(size, ih + 2 * size, ih + 2 * size);
+#else
+#pragma omp parallel for
+  for (int i = 0; i < 2 * size; i++) {
+    ih[i] = 1.0 / (1.0f + std::exp(-ih[i] - hh[i]));
+  }
+
+#pragma omp parallel for
+  for (int i = 0; i < size; i++) {
+    ih[2 * size + i] = std::tanh(ih[i] * ih[2 * size + i] + hh[2 * size + i]);
+  }
+#endif
 
   // 1%
   float *z = ih + size;
@@ -130,12 +149,21 @@ void GruInput(const torch::Tensor &output,
               const torch::Tensor &conditionerOutputs, int sample,
               int frameIndex) {
   int size = output.size(0);
-  float *sampleEmbeddingsPtr = sampleEmbeddings.data_ptr<float>();
-  float *conditionerOutputPtr = conditionerOutputs.data_ptr<float>();
-  float *output_ptr = output.data_ptr<float>();
+  float* sampleEmbeddingsPtr = sampleEmbeddings.data_ptr<float>();
+  float* conditionerOutputPtr = conditionerOutputs.data_ptr<float>();
+  float* output_ptr = output.data_ptr<float>();
 
+#if defined(__AVX2__)
   vsAdd(size, sampleEmbeddingsPtr + sample * size,
         conditionerOutputPtr + frameIndex * size, output_ptr);
+#else
+  ASSERT_BOOL(size % 4 == 0);
+  float* sampleEmbeds = sampleEmbeddingsPtr + sample * size;
+  float* condOuts = conditionerOutputPtr + frameIndex * size;
+  for(int i = 0; i < size; i += 4) {
+    vst1q_f32(output_ptr + i, vaddq_f32(vld1q_f32(sampleEmbeds + i), vld1q_f32(condOuts + i)));
+  }
+#endif
 }
 
 /**

@@ -1,8 +1,13 @@
 
 #include "gemv.h"
 
+#if defined(__AVX2__)
 #include <immintrin.h>
 #include <mkl.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include <omp.h>
 #include <torch/script.h>
 
@@ -28,8 +33,111 @@ void gemv(Tensor& out, const Tensor& bias, const Tensor& matrix,
 }
 
 }  // namespace wavernn::fallback
+#if defined(__ARM_NEON)
+namespace wavernn::neon {
+/**
+ * Compute a sparse matrix-vector multiply.
+ *
+ * @param output_size The number of output rows in this gemv.
+ * @param output Where to write the output (dense float32 vector).
+ * @param input Where to read the input data from (dense float32 vector).
+ * @param weights Packed weights.
+ * @param bias The bias vector (dense float32 vector).
+ * @param blocksPerRow Number of blocks involved in each row multiply.
+ * @param rowOffsets The offset in the weights for the nth row.
+ * @param indices The indices in the input vector to load blocks from.
+ */
+void sparse_gemv(int output_size, float* const __restrict__ output,
+                 const float* const __restrict__ input,
+                 const float* const __restrict__ weights,
+                 const float* const __restrict__ bias,
+                 const int* const __restrict__ blocksPerRow,
+                 const int* const __restrict__ rowOffsets,
+                 const int* const __restrict__ indices) {
+  // Parallelize the computation across the output row. Each thread can
+  // separately compute outputs for a block of the output vector.
+#pragma omp parallel for
+  for (int output_idx = 0; output_idx < output_size; output_idx++) {
+    // Number of block multiplications for this row.
+    int n_blocks = blocksPerRow[output_idx];
 
-#if defined(__AVX512F__)
+    // Where the weights for this row start.
+    const float* block_weights = weights + rowOffsets[output_idx];
+
+    // Where the input indices for this row start.
+    const int* block_indices = indices + rowOffsets[output_idx] / BLOCK_SIZE;
+
+    const float* input_1 = input + 4;
+    const float* block_weights_1 = block_weights + 4;
+
+    // Unroll the block multiplication loop by 4. This speeds up the gemvs by a
+    // little bit. If the number of blocks is not a multiple of 4, the follow-up
+    // loop will take care of it.
+    int block_idx = 0;
+    int n_blocks_grouped = n_blocks - (n_blocks % 4);
+    float32x4_t sum_vec_0 = vdupq_n_f32(0.0);
+    float32x4_t sum_vec_1 = vdupq_n_f32(0.0);
+    float32x4_t sum_vec_2 = vdupq_n_f32(0.0);
+    float32x4_t sum_vec_3 = vdupq_n_f32(0.0);
+    for (; block_idx < n_blocks_grouped; block_idx += 4) {
+      // Load the index of each block of the input.
+      int input_idx_0 = block_indices[block_idx + 0];
+      int input_idx_1 = block_indices[block_idx + 1];
+      int input_idx_2 = block_indices[block_idx + 2];
+      int input_idx_3 = block_indices[block_idx + 3];
+
+      // Load the data for the 4 input blocks.
+      float32x4_t input_vec_0_0 = vld1q_f32(input + input_idx_0);
+      float32x4_t input_vec_0_1 = vld1q_f32(input_1 + input_idx_0);
+      float32x4_t input_vec_1_0 = vld1q_f32(input + input_idx_1);
+      float32x4_t input_vec_1_1 = vld1q_f32(input_1 + input_idx_1);
+      float32x4_t input_vec_2_0 = vld1q_f32(input + input_idx_2);
+      float32x4_t input_vec_2_1 = vld1q_f32(input_1 + input_idx_2);
+      float32x4_t input_vec_3_0 = vld1q_f32(input + input_idx_3);
+      float32x4_t input_vec_3_1 = vld1q_f32(input_1 + input_idx_3);
+
+      // Load the data for the 4 weight blocks.
+      float32x4_t weight_vec_0_0 = vld1q_f32(block_weights + (block_idx + 0) * BLOCK_SIZE);
+      float32x4_t weight_vec_0_1 = vld1q_f32(block_weights_1 + (block_idx + 0) * BLOCK_SIZE);
+      float32x4_t weight_vec_1_0 = vld1q_f32(block_weights + (block_idx + 1) * BLOCK_SIZE);
+      float32x4_t weight_vec_1_1 = vld1q_f32(block_weights_1 + (block_idx + 1) * BLOCK_SIZE);
+      float32x4_t weight_vec_2_0 = vld1q_f32(block_weights + (block_idx + 2) * BLOCK_SIZE);
+      float32x4_t weight_vec_2_1 = vld1q_f32(block_weights_1 + (block_idx + 2) * BLOCK_SIZE);
+      float32x4_t weight_vec_3_0 = vld1q_f32(block_weights + (block_idx + 3) * BLOCK_SIZE);
+      float32x4_t weight_vec_3_1 = vld1q_f32(block_weights_1 + (block_idx + 3) * BLOCK_SIZE);
+
+      // Perform multiplications and accumulate into the accumulators.
+      sum_vec_0 = vmlaq_f32(vmlaq_f32(sum_vec_0, weight_vec_0_0, input_vec_0_0), weight_vec_0_1, input_vec_0_1);
+      sum_vec_1 = vmlaq_f32(vmlaq_f32(sum_vec_1, weight_vec_1_0, input_vec_1_0), weight_vec_1_1, input_vec_1_1);
+      sum_vec_2 = vmlaq_f32(vmlaq_f32(sum_vec_2, weight_vec_2_0, input_vec_2_0), weight_vec_2_1, input_vec_2_1);
+      sum_vec_3 = vmlaq_f32(vmlaq_f32(sum_vec_3, weight_vec_3_0, input_vec_3_0), weight_vec_3_1, input_vec_3_1);
+    }
+
+    // Sum up accumulators to get an accumulator for the follow-up loop.
+    float32x4_t sum_vec = vaddq_f32(vaddq_f32(sum_vec_0, sum_vec_1), vaddq_f32(sum_vec_2, sum_vec_3));
+    for (; block_idx < n_blocks; block_idx++) {
+      // Load the input block.
+      float32x4_t input_vec_0 = vld1q_f32(input + block_indices[block_idx]);
+      float32x4_t input_vec_1 = vld1q_f32(input_1 + block_indices[block_idx]);
+
+      // Load the weight block.
+      float32x4_t weight_vec_0 = vld1q_f32(block_weights + block_idx * BLOCK_SIZE);
+      float32x4_t weight_vec_1 = vld1q_f32(block_weights_1 + block_idx * BLOCK_SIZE);
+
+      // Multiply and accumulate.
+      sum_vec = vmlaq_f32(vmlaq_f32(sum_vec, weight_vec_0, input_vec_0), weight_vec_1, input_vec_1);
+    }
+
+    // Compute the horizontal sum, add in the bias, and write to the output.
+    float32x2_t res = vadd_f32(vget_high_f32(sum_vec), vget_low_f32(sum_vec));
+    float sum = vget_lane_f32(vpadd_f32(res, res), 0);
+    output[output_idx] = bias[output_idx] + sum;
+  }
+}
+
+}  // namespace wavernn::neon
+
+#elif defined(__AVX512F__)
 namespace wavernn::avx512 {
 /**
  * Compute a sparse matrix-vector multiply.
@@ -601,13 +709,18 @@ PackedLinear::PackedLinear(const Tensor& matrix, const Tensor& bias,
 void PackedLinear::gemv(Tensor& out, const Tensor& vector) const {
   ASSERT_TENSOR_SIZE(out, output_size_);
   ASSERT_TENSOR_SIZE(vector, input_size_);
-#if defined(__AVX512F__)
-  if (quantized_) {
-    const float* const __restrict__ input = vector.data_ptr<float>();
-    int16_t inputQuantized[input_size_];
-    float inputScale =
-        wavernn::avx512::quantize_vector(input_size_, input, inputQuantized);
 
+  // Quantized inference only available on some platforms.
+#if defined(__AVX2__) || defined(__AVX512F__)
+  bool allowQuantized = true;
+#else
+  bool allowQuantized = false;
+#endif
+
+  if (allowQuantized && quantized_) {
+
+#if defined(__AVX2__) || defined(__AVX512F__)
+    const float* const __restrict__ input = vector.data_ptr<float>();
     float* const __restrict__ output = out.data_ptr<float>();
     const int16_t* const __restrict__ weights = quantizedData_.data();
     const float* const __restrict__ bias = bias_.data_ptr<float>();
@@ -615,37 +728,25 @@ void PackedLinear::gemv(Tensor& out, const Tensor& vector) const {
     const int* const __restrict__ rowOffsets = quantizedRowOffsets_.data();
     const int* const __restrict__ indices = quantizedIndices_.data();
     const float* const __restrict__ rowScales = quantizedRowScales_.data();
+
+    int16_t inputQuantized[input_size_];
+#endif
+
+#if defined(__AVX512F__)
+    float inputScale =
+        wavernn::avx512::quantize_vector(input_size_, input, inputQuantized);
     wavernn::avx512::sparse_gemv_quantized(
         output_size_, output, inputQuantized, inputScale, weights, bias,
         blocksPerRow, rowOffsets, indices, rowScales);
-  } else {
-    float* const __restrict__ output = out.data_ptr<float>();
-    const float* const __restrict__ input = vector.data_ptr<float>();
-    const float* const __restrict__ weights = data_.data();
-    const float* const __restrict__ bias = bias_.data_ptr<float>();
-    const int* const __restrict__ blocksPerRow = blocksPerRow_.data();
-    const int* const __restrict__ rowOffsets = rowOffsets_.data();
-    const int* const __restrict__ indices = indices_.data();
-    wavernn::avx512::sparse_gemv(output_size_, output, input, weights, bias,
-                                 blocksPerRow, rowOffsets, indices);
-  }
 #elif defined(__AVX2__)
-  if (quantized_) {
-    const float* const __restrict__ input = vector.data_ptr<float>();
-    int16_t inputQuantized[input_size_];
     float inputScale =
         wavernn::avx2::quantize_vector(input_size_, input, inputQuantized);
-
-    float* const __restrict__ output = out.data_ptr<float>();
-    const int16_t* const __restrict__ weights = quantizedData_.data();
-    const float* const __restrict__ bias = bias_.data_ptr<float>();
-    const int* const __restrict__ blocksPerRow = quantizedBlocksPerRow_.data();
-    const int* const __restrict__ rowOffsets = quantizedRowOffsets_.data();
-    const int* const __restrict__ indices = quantizedIndices_.data();
-    const float* const __restrict__ rowScales = quantizedRowScales_.data();
     wavernn::avx2::sparse_gemv_quantized(
         output_size_, output, inputQuantized, inputScale, weights, bias,
         blocksPerRow, rowOffsets, indices, rowScales);
+#else
+    throw std::runtime_error("Quantized inference only supported with AVX");
+#endif
   } else {
     float* const __restrict__ output = out.data_ptr<float>();
     const float* const __restrict__ input = vector.data_ptr<float>();
@@ -654,12 +755,20 @@ void PackedLinear::gemv(Tensor& out, const Tensor& vector) const {
     const int* const __restrict__ blocksPerRow = blocksPerRow_.data();
     const int* const __restrict__ rowOffsets = rowOffsets_.data();
     const int* const __restrict__ indices = indices_.data();
+
+#if defined(__AVX512F__)
+    wavernn::avx512::sparse_gemv(output_size_, output, input, weights, bias,
+                                 blocksPerRow, rowOffsets, indices);
+#elif defined(__AVX2__)
     wavernn::avx2::sparse_gemv(output_size_, output, input, weights, bias,
                                blocksPerRow, rowOffsets, indices);
-  }
+#elif defined(__ARM_NEON)
+    wavernn::neon::sparse_gemv(output_size_, output, input, weights, bias,
+                               blocksPerRow, rowOffsets, indices);
 #else
-  wavernn::fallback::gemv(out, bias_, matrix_, vector);
+    wavernn::fallback::gemv(out, bias_, matrix_, vector);
 #endif
+  }
 }
 
 }  // namespace wavernn

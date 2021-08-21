@@ -23,7 +23,10 @@ To learn about what WaveRNN is or understand the nitty-gritty details of impleme
 Prior to installation, we recommend setting up your environment with
 [pyenv](https://github.com/pyenv/pyenv) with Python 3.9.6 and a [virtualenv](https://docs.python.org/3/library/venv.html). The
 remainder of the installation instructions assume that you are using an
-appropriate environment or virtualenv.
+appropriate environment or virtualenv. You will also need the following packages:
+```
+$ sudo apt install python3-dev g++ libsndfile-dev
+```
 
 First, install MKL, which is needed to build the extension modules. You can
 follow the installation instructions
