@@ -78,6 +78,97 @@ int SampleFromSoftmax(const Tensor &distribution) {
 
 namespace wavernn {
 
+#if defined(__AVX512F__)
+
+namespace avx512 {
+// Source:
+// https://pdfs.semanticscholar.org/bb2a/f84f8a179ac5486cf197c409c01289ff9064.pdf
+// https://github.com/hfp/libxsmm/blob/55c6a9f92a6ff0b7124ff351aa3f7c20ec789170/include/libxsmm_intrinsics_x86.h#L653
+inline __m512 _mm512_tanh_ps(__m512 x) {
+  const __m512 c0 = _mm512_set1_ps(2027025.0f);
+  const __m512 c1 = _mm512_set1_ps(270270.0f);
+  const __m512 c2 = _mm512_set1_ps(6930.0f);
+  const __m512 c3 = _mm512_set1_ps(36.0f);
+  const __m512 c1_d = _mm512_set1_ps(945945.0f);
+  const __m512 c2_d = _mm512_set1_ps(51975.0f);
+  const __m512 c3_d = _mm512_set1_ps(630.0f);
+  const __m512 hi_bound = _mm512_set1_ps(4.97f);
+  const __m512 lo_bound = _mm512_set1_ps(-4.97f);
+  const __m512 ones = _mm512_set1_ps(1.0f);
+  const __m512 neg_ones = _mm512_set1_ps(-1.0f);
+
+  const __m512 x2 = _mm512_mul_ps(x, x);
+  const __m512 t1_nom = _mm512_fmadd_ps(c3, x2, c2);
+  const __m512 t2_nom = _mm512_fmadd_ps(t1_nom, x2, c1);
+  const __m512 t3_nom = _mm512_fmadd_ps(t2_nom, x2, c0);
+  const __m512 nom = _mm512_mul_ps(t3_nom, x);
+  const __m512 t1_denom = _mm512_add_ps(x2, c3_d);
+  const __m512 t2_denom = _mm512_fmadd_ps(t1_denom, x2, c2_d);
+  const __m512 t3_denom = _mm512_fmadd_ps(t2_denom, x2, c1_d);
+  const __m512 denom = _mm512_fmadd_ps(t3_denom, x2, c0);
+  const __m512 denom_rcp = _mm512_rcp14_ps(denom);
+  const __mmask16 mask_hi = _mm512_cmp_ps_mask(x, hi_bound, _CMP_GT_OQ);
+  const __mmask16 mask_lo = _mm512_cmp_ps_mask(x, lo_bound, _CMP_LT_OQ);
+  __m512 result = _mm512_mul_ps(nom, denom_rcp);
+  result = _mm512_mask_blend_ps(mask_hi, result, ones);
+  result = _mm512_mask_blend_ps(mask_lo, result, neg_ones);
+
+  return result;
+}
+
+inline __m512 _mm512_sigmoid_ps(__m512 x) {
+  const __m512 half = _mm512_set1_ps(0.5f);
+  x = _mm512_mul_ps(x, half);
+  x = _mm512_tanh_ps(x);
+  return _mm512_fmadd_ps(half, x, half);
+}
+
+}  // namespace avx512
+#elif defined(__AVX2__)
+namespace avx2 {
+inline __m256 _mm256_tanh_ps(__m256 x) {
+  const __m256 c0 = _mm256_set1_ps(2027025.0f);
+  const __m256 c1 = _mm256_set1_ps(270270.0f);
+  const __m256 c2 = _mm256_set1_ps(6930.0f);
+  const __m256 c3 = _mm256_set1_ps(36.0f);
+  const __m256 c1_d = _mm256_set1_ps(945945.0f);
+  const __m256 c2_d = _mm256_set1_ps(51975.0f);
+  const __m256 c3_d = _mm256_set1_ps(630.0f);
+  const __m256 hi_bound = _mm256_set1_ps(4.97f);
+  const __m256 lo_bound = _mm256_set1_ps(-4.97f);
+  const __m256 ones = _mm256_set1_ps(1.0f);
+  const __m256 neg_ones = _mm256_set1_ps(-1.0f);
+
+  const __m256 x2 = _mm256_mul_ps(x, x);
+  const __m256 t1_nom = _mm256_fmadd_ps(c3, x2, c2);
+  const __m256 t2_nom = _mm256_fmadd_ps(t1_nom, x2, c1);
+  const __m256 t3_nom = _mm256_fmadd_ps(t2_nom, x2, c0);
+  const __m256 nom = _mm256_mul_ps(t3_nom, x);
+  const __m256 t1_denom = _mm256_add_ps(x2, c3_d);
+  const __m256 t2_denom = _mm256_fmadd_ps(t1_denom, x2, c2_d);
+  const __m256 t3_denom = _mm256_fmadd_ps(t2_denom, x2, c1_d);
+  const __m256 denom = _mm256_fmadd_ps(t3_denom, x2, c0);
+  const __m256 denom_rcp = _mm256_rcp_ps(denom);
+  const __m256 mask_hi = _mm256_cmp_ps(x, hi_bound, _CMP_GT_OQ);
+  const __m256 mask_lo = _mm256_cmp_ps(x, lo_bound, _CMP_LT_OQ);
+  __m256 result = _mm256_mul_ps(nom, denom_rcp);
+  result = _mm256_blendv_ps(result, ones, mask_hi);
+  result = _mm256_blendv_ps(result, neg_ones, mask_lo);
+
+  return result;
+}
+
+inline __m256 _mm256_sigmoid_ps(__m256 x) {
+  const __m256 half = _mm256_set1_ps(0.5f);
+  x = _mm256_mul_ps(x, half);
+  x = _mm256_tanh_ps(x);
+  return _mm256_fmadd_ps(half, x, half);
+}
+
+}  // namespace avx2
+
+#endif
+
 int SoftmaxSampleFromLogits(const torch::Tensor &logits) {
   auto distribution = at::softmax(logits, 0);
   return SampleFromSoftmax(distribution);
@@ -91,6 +182,29 @@ void UpdateGruState(const torch::Tensor &gruState, const torch::Tensor &gruIh,
   float *state = gruState.data_ptr<float>();
 
 #if defined(__AVX2__)
+  // AVX2 implementation.
+#if 1
+  ASSERT_BOOL(size % 8 == 0);
+
+  for (int i = 0; i < size; i += 8) {
+    __m256 ih_r = _mm256_loadu_ps(ih + i);
+    __m256 hh_r = _mm256_loadu_ps(hh + i);
+    __m256 r = avx2::_mm256_sigmoid_ps(_mm256_add_ps(ih_r, hh_r));
+
+    __m256 ih_z = _mm256_loadu_ps(ih + size + i);
+    __m256 hh_z = _mm256_loadu_ps(hh + size + i);
+    __m256 z = avx2::_mm256_sigmoid_ps(_mm256_add_ps(ih_z, hh_z));
+
+    __m256 ih_n = _mm256_loadu_ps(ih + 2 * size + i);
+    __m256 hh_n = _mm256_loadu_ps(hh + 2 * size + i);
+    __m256 n = avx2::_mm256_tanh_ps(_mm256_fmadd_ps(r, hh_n, ih_n));
+
+    __m256 z1m = _mm256_sub_ps(_mm256_set1_ps(1.0), z);
+    __m256 s = _mm256_loadu_ps(state + i);
+    __m256 s_new = _mm256_add_ps(_mm256_mul_ps(z1m, n), _mm256_mul_ps(s, z));
+    _mm256_storeu_ps(state + i, s_new);
+  }
+#else
   vsAdd(2 * size, ih, hh, ih);
 
 #pragma omp simd
@@ -110,7 +224,17 @@ void UpdateGruState(const torch::Tensor &gruState, const torch::Tensor &gruIh,
   vsMul(size, ih, hh + 2 * size, hh + 2 * size);
   vsAdd(size, ih + 2 * size, hh + 2 * size, ih + 2 * size);
   vsTanh(size, ih + 2 * size, ih + 2 * size);
+
+  float *z = ih + size;
+  float *n = ih + 2 * size;
+#pragma omp simd
+  for (int i = 0; i < size; i++) {
+    state[i] = (1 - z[i]) * n[i] + z[i] * state[i];
+  }
+#endif
+
 #else
+  // Fallback implementation.
 #pragma omp parallel for
   for (int i = 0; i < 2 * size; i++) {
     ih[i] = 1.0 / (1.0f + std::exp(-ih[i] - hh[i]));
@@ -120,15 +244,15 @@ void UpdateGruState(const torch::Tensor &gruState, const torch::Tensor &gruIh,
   for (int i = 0; i < size; i++) {
     ih[2 * size + i] = std::tanh(ih[i] * ih[2 * size + i] + hh[2 * size + i]);
   }
-#endif
 
-  // 1%
   float *z = ih + size;
   float *n = ih + 2 * size;
 #pragma omp simd
   for (int i = 0; i < size; i++) {
     state[i] = (1 - z[i]) * n[i] + z[i] * state[i];
   }
+
+#endif
 }
 
 /**
@@ -149,19 +273,20 @@ void GruInput(const torch::Tensor &output,
               const torch::Tensor &conditionerOutputs, int sample,
               int frameIndex) {
   int size = output.size(0);
-  float* sampleEmbeddingsPtr = sampleEmbeddings.data_ptr<float>();
-  float* conditionerOutputPtr = conditionerOutputs.data_ptr<float>();
-  float* output_ptr = output.data_ptr<float>();
+  float *sampleEmbeddingsPtr = sampleEmbeddings.data_ptr<float>();
+  float *conditionerOutputPtr = conditionerOutputs.data_ptr<float>();
+  float *output_ptr = output.data_ptr<float>();
 
 #if defined(__AVX2__)
   vsAdd(size, sampleEmbeddingsPtr + sample * size,
         conditionerOutputPtr + frameIndex * size, output_ptr);
 #else
   ASSERT_BOOL(size % 4 == 0);
-  float* sampleEmbeds = sampleEmbeddingsPtr + sample * size;
-  float* condOuts = conditionerOutputPtr + frameIndex * size;
-  for(int i = 0; i < size; i += 4) {
-    vst1q_f32(output_ptr + i, vaddq_f32(vld1q_f32(sampleEmbeds + i), vld1q_f32(condOuts + i)));
+  float *sampleEmbeds = sampleEmbeddingsPtr + sample * size;
+  float *condOuts = conditionerOutputPtr + frameIndex * size;
+  for (int i = 0; i < size; i += 4) {
+    vst1q_f32(output_ptr + i,
+              vaddq_f32(vld1q_f32(sampleEmbeds + i), vld1q_f32(condOuts + i)));
   }
 #endif
 }
