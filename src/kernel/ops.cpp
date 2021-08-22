@@ -224,6 +224,56 @@ inline __m256 _mm256_sigmoid_ps(__m256 x) {
 
 }  // namespace avx2
 
+#elif defined(__ARM_NEON)
+namespace neon {
+// Source:
+// https://pdfs.semanticscholar.org/bb2a/f84f8a179ac5486cf197c409c01289ff9064.pdf
+// https://github.com/hfp/libxsmm/blob/55c6a9f92a6ff0b7124ff351aa3f7c20ec789170/include/libxsmm_intrinsics_x86.h#L653
+inline float32x4_t vtanhq_f32(float32x4_t x) {
+  const auto c0 = vdupq_n_f32(2027025.0f);
+  const auto c1 = vdupq_n_f32(270270.0f);
+  const auto c2 = vdupq_n_f32(6930.0f);
+  const auto c3 = vdupq_n_f32(36.0f);
+  const auto c1_d = vdupq_n_f32(945945.0f);
+  const auto c2_d = vdupq_n_f32(51975.0f);
+  const auto c3_d = vdupq_n_f32(630.0f);
+  const auto hi_bound = vdupq_n_f32(4.97f);
+  const auto lo_bound = vdupq_n_f32(-4.97f);
+  const auto ones = vdupq_n_f32(1.0f);
+  const auto neg_ones = vdupq_n_f32(-1.0f);
+
+  const auto x2 = vmulq_f32(x, x);
+  const auto t1_nom = vmlaq_f32(c2, c3, x2);
+  const auto t2_nom = vmlaq_f32(c1, t1_nom, x2);
+  const auto t3_nom = vmlaq_f32(c0, t2_nom, x2);
+  const auto nom = vmulq_f32(t3_nom, x);
+  const auto t1_denom = vaddq_f32(x2, c3_d);
+  const auto t2_denom = vmlaq_f32(c2_d, t1_denom, x2);
+  const auto t3_denom = vmlaq_f32(c1_d, t2_denom, x2);
+  const auto denom = vmlaq_f32(c0, t3_denom, x2);
+
+  auto denom_rcp = vrecpeq_f32(denom);
+  denom_rcp = vmulq_f32(vrecpsq_f32(denom, denom_rcp), denom_rcp);
+  denom_rcp = vmulq_f32(vrecpsq_f32(denom, denom_rcp), denom_rcp);
+
+  const uint32x4_t mask_hi = vcgtq_f32(x, hi_bound);
+  const uint32x4_t mask_lo = vcltq_f32(x, lo_bound);
+  auto result = vmulq_f32(nom, denom_rcp);
+  result = vbslq_f32(mask_hi, ones, result);
+  result = vbslq_f32(mask_lo, neg_ones, result);
+
+  return result;
+}
+
+inline float32x4_t vsigmoidq_f32(float32x4_t x) {
+  const auto half = vdupq_n_f32(0.5f);
+  x = vmulq_f32(x, half);
+  x = vtanhq_f32(x);
+  return vmlaq_f32(half, half, x);
+}
+
+}  // namespace neon
+
 #endif
 
 int SoftmaxSampleFromLogits(const torch::Tensor &logits) {
@@ -243,11 +293,31 @@ void UpdateGruState(const torch::Tensor &gruState, const torch::Tensor &gruIh,
   float *hh = gruHh.data_ptr<float>();
   float *state = gruState.data_ptr<float>();
 
-#if defined(__AVX2__)
-  // AVX2 implementation.
-  ASSERT_BOOL(size % 8 == 0);
+#if defined(__AVX512F__)
+  int corrected = size - (size % 16);
+#pragma omp parallel for
+  for (int i = 0; i < corrected; i += 16) {
+    auto ih_r = _mm512_loadu_ps(ih + i);
+    auto hh_r = _mm512_loadu_ps(hh + i);
+    auto r = avx512::_mm512_sigmoid_ps(_mm512_add_ps(ih_r, hh_r));
 
-  for (int i = 0; i < size; i += 8) {
+    auto ih_z = _mm512_loadu_ps(ih + size + i);
+    auto hh_z = _mm512_loadu_ps(hh + size + i);
+    auto z = avx512::_mm512_sigmoid_ps(_mm512_add_ps(ih_z, hh_z));
+
+    auto ih_n = _mm512_loadu_ps(ih + 2 * size + i);
+    auto hh_n = _mm512_loadu_ps(hh + 2 * size + i);
+    auto n = avx512::_mm512_tanh_ps(_mm512_fmadd_ps(r, hh_n, ih_n));
+
+    auto z1m = _mm512_sub_ps(_mm512_set1_ps(1.0), z);
+    auto s = _mm512_loadu_ps(state + i);
+    auto s_new = _mm512_add_ps(_mm512_mul_ps(z1m, n), _mm512_mul_ps(s, z));
+    _mm512_storeu_ps(state + i, s_new);
+  }
+#elif defined(__AVX2__)
+  int corrected = size - (size % 8);
+#pragma omp parallel for
+  for (int i = 0; i < corrected; i += 8) {
     __m256 ih_r = _mm256_loadu_ps(ih + i);
     __m256 hh_r = _mm256_loadu_ps(hh + i);
     __m256 r = avx2::_mm256_sigmoid_ps(_mm256_add_ps(ih_r, hh_r));
@@ -265,26 +335,38 @@ void UpdateGruState(const torch::Tensor &gruState, const torch::Tensor &gruIh,
     __m256 s_new = _mm256_add_ps(_mm256_mul_ps(z1m, n), _mm256_mul_ps(s, z));
     _mm256_storeu_ps(state + i, s_new);
   }
+#elif defined(__ARM_NEON)
+  int corrected = size - (size % 4);
+#pragma omp parallel for
+  for (int i = 0; i < corrected; i += 4) {
+    auto ih_r = vld1q_f32(ih + i);
+    auto hh_r = vld1q_f32(hh + i);
+    auto r = neon::vsigmoidq_f32(vaddq_f32(ih_r, hh_r));
+
+    auto ih_z = vld1q_f32(ih + size + i);
+    auto hh_z = vld1q_f32(hh + size + i);
+    auto z = neon::vsigmoidq_f32(vaddq_f32(ih_z, hh_z));
+
+    auto ih_n = vld1q_f32(ih + 2 * size + i);
+    auto hh_n = vld1q_f32(hh + 2 * size + i);
+    auto n = neon::vtanhq_f32(vmlaq_f32(ih_n, r, hh_n));
+
+    auto z1m = vsubq_f32(vdupq_n_f32(1.0), z);
+    auto s = vld1q_f32(state + i);
+    auto s_new = vaddq_f32(vmulq_f32(z1m, n), vmulq_f32(s, z));
+    vst1q_f32(state + i, s_new);
+  }
 #else
-  // Fallback implementation.
-#pragma omp parallel for
-  for (int i = 0; i < 2 * size; i++) {
-    ih[i] = 1.0 / (1.0f + std::exp(-ih[i] - hh[i]));
-  }
-
-#pragma omp parallel for
-  for (int i = 0; i < size; i++) {
-    ih[2 * size + i] = std::tanh(ih[i] * ih[2 * size + i] + hh[2 * size + i]);
-  }
-
-  float *z = ih + size;
-  float *n = ih + 2 * size;
-#pragma omp simd
-  for (int i = 0; i < size; i++) {
-    state[i] = (1 - z[i]) * n[i] + z[i] * state[i];
-  }
-
+  int corrected = 0;
 #endif
+
+  // Fallback or tail implementation.
+  for(int i = corrected;i < size; i++) {
+    float r = 1.0 / (1.0f + std::exp(-ih[i] - hh[i]));
+    float z = 1.0 / (1.0f + std::exp(-ih[size + i] - hh[size + i]));
+    float n = std::tanh(ih[2 * size + i] + r * hh[2 * size + i]);
+    state[i] = (1 - z) * n + z * state[i];
+  }
 }
 
 /**
