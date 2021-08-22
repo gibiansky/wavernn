@@ -2,7 +2,6 @@
 
 #if defined(__AVX2__)
 #include <immintrin.h>
-#include <mkl.h>
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -306,22 +305,43 @@ void GruInput(const torch::Tensor &output,
               const torch::Tensor &conditionerOutputs, int sample,
               int frameIndex) {
   int size = output.size(0);
-  float *sampleEmbeddingsPtr = sampleEmbeddings.data_ptr<float>();
-  float *conditionerOutputPtr = conditionerOutputs.data_ptr<float>();
-  float *output_ptr = output.data_ptr<float>();
+  float *sampleEmbeddingsPtr =
+      sampleEmbeddings.data_ptr<float>() + sample * size;
+  float *conditionerOutputPtr =
+      conditionerOutputs.data_ptr<float>() + frameIndex * size;
+  float *outputPtr = output.data_ptr<float>();
 
+  int i = 0;
 #if defined(__AVX2__)
-  vsAdd(size, sampleEmbeddingsPtr + sample * size,
-        conditionerOutputPtr + frameIndex * size, output_ptr);
-#else
-  ASSERT_BOOL(size % 4 == 0);
-  float *sampleEmbeds = sampleEmbeddingsPtr + sample * size;
-  float *condOuts = conditionerOutputPtr + frameIndex * size;
-  for (int i = 0; i < size; i += 4) {
-    vst1q_f32(output_ptr + i,
-              vaddq_f32(vld1q_f32(sampleEmbeds + i), vld1q_f32(condOuts + i)));
+  int corrected = size - (size % 8);
+  for (; i < corrected; i += 8) {
+    auto a = _mm256_loadu_ps(sampleEmbeddingsPtr + i);
+    auto b = _mm256_loadu_ps(conditionerOutputPtr + i);
+    auto sum = _mm256_add_ps(a, b);
+    _mm256_storeu_ps(outputPtr + i, sum);
+  }
+#elif defined(__AVX512__)
+  int corrected = size - (size % 16);
+  for (; i < corrected; i += 16) {
+    auto a = _mm512_loadu_ps(sampleEmbeddingsPtr + i);
+    auto b = _mm512_loadu_ps(conditionerOutputPtr + i);
+    auto sum = _mm512_add_ps(a, b);
+    _mm512_storeu_ps(outputPtr + i, sum);
+  }
+#elif defined(__ARM_NEON)
+  int corrected = size - (size % 4);
+  for (; i < corrected; i += 4) {
+    auto a = vld1q_f32(sampleEmbeddingsPtr + i);
+    auto b = vld1q_f32(conditionerOutputPtr + i);
+    auto sum = vaddq_f32(a, b);
+    vst1q_f32(outputPtr + i, sum);
   }
 #endif
+
+  // Fallback or tail case.
+  for (; i < size; i++) {
+    outputPtr[i] = sampleEmbeddingsPtr[i] + conditionerOutputPtr[i];
+  }
 }
 
 /**

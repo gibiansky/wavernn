@@ -1,19 +1,8 @@
 """
 setup.py for WaveRNN package.
 """
-import platform
 import setuptools  # type: ignore
 from torch.utils.cpp_extension import BuildExtension, CppExtension
-
-is_arm = platform.machine() == "aarch64"
-if is_arm:
-    mkl_libraries = []
-    mkl_compile_args = []
-    mkl_link_args = []
-else:
-    mkl_libraries = ["mkl_rt"]
-    mkl_compile_args = ["-I/opt/intel/mkl/include", "-I/usr/include/mkl"]
-    mkl_link_args = ["-L/opt/intel/mkl/lib/intel64/"]
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -55,9 +44,11 @@ setuptools.setup(
                 "src/kernel/ops.cpp",
                 "src/kernel/timer.cpp",
             ],
-            libraries=mkl_libraries,
-            extra_compile_args=["-ffast-math", "-Ofast", "-march=native", "-fopenmp"] + mkl_compile_args,
-            extra_link_args=mkl_link_args,
+            extra_compile_args=[
+                "-Ofast",
+                "-march=native",
+                "-fopenmp",
+            ],
         )
     ],
     cmdclass={"build_ext": BuildExtension.with_options(no_python_abi_suffix=True)},

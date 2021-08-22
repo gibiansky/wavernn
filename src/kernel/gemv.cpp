@@ -3,7 +3,6 @@
 
 #if defined(__AVX2__)
 #include <immintrin.h>
-#include <mkl.h>
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -97,35 +96,51 @@ void sparse_gemv(int output_size, float* const __restrict__ output,
       float32x4_t input_vec_3_1 = vld1q_f32(input_1 + input_idx_3);
 
       // Load the data for the 4 weight blocks.
-      float32x4_t weight_vec_0_0 = vld1q_f32(block_weights + (block_idx + 0) * BLOCK_SIZE);
-      float32x4_t weight_vec_0_1 = vld1q_f32(block_weights_1 + (block_idx + 0) * BLOCK_SIZE);
-      float32x4_t weight_vec_1_0 = vld1q_f32(block_weights + (block_idx + 1) * BLOCK_SIZE);
-      float32x4_t weight_vec_1_1 = vld1q_f32(block_weights_1 + (block_idx + 1) * BLOCK_SIZE);
-      float32x4_t weight_vec_2_0 = vld1q_f32(block_weights + (block_idx + 2) * BLOCK_SIZE);
-      float32x4_t weight_vec_2_1 = vld1q_f32(block_weights_1 + (block_idx + 2) * BLOCK_SIZE);
-      float32x4_t weight_vec_3_0 = vld1q_f32(block_weights + (block_idx + 3) * BLOCK_SIZE);
-      float32x4_t weight_vec_3_1 = vld1q_f32(block_weights_1 + (block_idx + 3) * BLOCK_SIZE);
+      float32x4_t weight_vec_0_0 =
+          vld1q_f32(block_weights + (block_idx + 0) * BLOCK_SIZE);
+      float32x4_t weight_vec_0_1 =
+          vld1q_f32(block_weights_1 + (block_idx + 0) * BLOCK_SIZE);
+      float32x4_t weight_vec_1_0 =
+          vld1q_f32(block_weights + (block_idx + 1) * BLOCK_SIZE);
+      float32x4_t weight_vec_1_1 =
+          vld1q_f32(block_weights_1 + (block_idx + 1) * BLOCK_SIZE);
+      float32x4_t weight_vec_2_0 =
+          vld1q_f32(block_weights + (block_idx + 2) * BLOCK_SIZE);
+      float32x4_t weight_vec_2_1 =
+          vld1q_f32(block_weights_1 + (block_idx + 2) * BLOCK_SIZE);
+      float32x4_t weight_vec_3_0 =
+          vld1q_f32(block_weights + (block_idx + 3) * BLOCK_SIZE);
+      float32x4_t weight_vec_3_1 =
+          vld1q_f32(block_weights_1 + (block_idx + 3) * BLOCK_SIZE);
 
       // Perform multiplications and accumulate into the accumulators.
-      sum_vec_0 = vmlaq_f32(vmlaq_f32(sum_vec_0, weight_vec_0_0, input_vec_0_0), weight_vec_0_1, input_vec_0_1);
-      sum_vec_1 = vmlaq_f32(vmlaq_f32(sum_vec_1, weight_vec_1_0, input_vec_1_0), weight_vec_1_1, input_vec_1_1);
-      sum_vec_2 = vmlaq_f32(vmlaq_f32(sum_vec_2, weight_vec_2_0, input_vec_2_0), weight_vec_2_1, input_vec_2_1);
-      sum_vec_3 = vmlaq_f32(vmlaq_f32(sum_vec_3, weight_vec_3_0, input_vec_3_0), weight_vec_3_1, input_vec_3_1);
+      sum_vec_0 = vmlaq_f32(vmlaq_f32(sum_vec_0, weight_vec_0_0, input_vec_0_0),
+                            weight_vec_0_1, input_vec_0_1);
+      sum_vec_1 = vmlaq_f32(vmlaq_f32(sum_vec_1, weight_vec_1_0, input_vec_1_0),
+                            weight_vec_1_1, input_vec_1_1);
+      sum_vec_2 = vmlaq_f32(vmlaq_f32(sum_vec_2, weight_vec_2_0, input_vec_2_0),
+                            weight_vec_2_1, input_vec_2_1);
+      sum_vec_3 = vmlaq_f32(vmlaq_f32(sum_vec_3, weight_vec_3_0, input_vec_3_0),
+                            weight_vec_3_1, input_vec_3_1);
     }
 
     // Sum up accumulators to get an accumulator for the follow-up loop.
-    float32x4_t sum_vec = vaddq_f32(vaddq_f32(sum_vec_0, sum_vec_1), vaddq_f32(sum_vec_2, sum_vec_3));
+    float32x4_t sum_vec = vaddq_f32(vaddq_f32(sum_vec_0, sum_vec_1),
+                                    vaddq_f32(sum_vec_2, sum_vec_3));
     for (; block_idx < n_blocks; block_idx++) {
       // Load the input block.
       float32x4_t input_vec_0 = vld1q_f32(input + block_indices[block_idx]);
       float32x4_t input_vec_1 = vld1q_f32(input_1 + block_indices[block_idx]);
 
       // Load the weight block.
-      float32x4_t weight_vec_0 = vld1q_f32(block_weights + block_idx * BLOCK_SIZE);
-      float32x4_t weight_vec_1 = vld1q_f32(block_weights_1 + block_idx * BLOCK_SIZE);
+      float32x4_t weight_vec_0 =
+          vld1q_f32(block_weights + block_idx * BLOCK_SIZE);
+      float32x4_t weight_vec_1 =
+          vld1q_f32(block_weights_1 + block_idx * BLOCK_SIZE);
 
       // Multiply and accumulate.
-      sum_vec = vmlaq_f32(vmlaq_f32(sum_vec, weight_vec_0, input_vec_0), weight_vec_1, input_vec_1);
+      sum_vec = vmlaq_f32(vmlaq_f32(sum_vec, weight_vec_0, input_vec_0),
+                          weight_vec_1, input_vec_1);
     }
 
     // Compute the horizontal sum, add in the bias, and write to the output.
@@ -252,7 +267,7 @@ float quantize_vector(int size, const float* const __restrict__ input,
 }
 
 inline __m512i _mm512_loadu_epi16(const void* addr) {
-  return _mm512_loadu_si512((__m512*) addr);
+  return _mm512_loadu_si512((__m512*)addr);
 }
 
 /**
@@ -343,12 +358,11 @@ void sparse_gemv_quantized(int output_size, float* const __restrict__ output,
                                        _mm512_add_epi32(sum_vec_2, sum_vec_3));
     for (; block_idx < n_blocks; block_idx++) {
       // Load the input block.
-      __m512i input_vec =
-          _mm512_loadu_epi16(input + block_indices[block_idx]);
+      __m512i input_vec = _mm512_loadu_epi16(input + block_indices[block_idx]);
 
       // Load the weight block.
-      __m512i weight_vec = _mm512_loadu_epi16(
-          block_weights + block_idx * QUANTIZED_BLOCK_SIZE);
+      __m512i weight_vec =
+          _mm512_loadu_epi16(block_weights + block_idx * QUANTIZED_BLOCK_SIZE);
 
       // Multiply and accumulate.
       sum_vec =
@@ -718,7 +732,6 @@ void PackedLinear::gemv(Tensor& out, const Tensor& vector) const {
 #endif
 
   if (allowQuantized && quantized_) {
-
 #if defined(__AVX2__) || defined(__AVX512F__)
     const float* const __restrict__ input = vector.data_ptr<float>();
     float* const __restrict__ output = out.data_ptr<float>();
