@@ -361,7 +361,7 @@ void UpdateGruState(const torch::Tensor &gruState, const torch::Tensor &gruIh,
 #endif
 
   // Fallback or tail implementation.
-  for(int i = corrected;i < size; i++) {
+  for (int i = corrected; i < size; i++) {
     float r = 1.0 / (1.0f + std::exp(-ih[i] - hh[i]));
     float z = 1.0 / (1.0f + std::exp(-ih[size + i] - hh[size + i]));
     float n = std::tanh(ih[2 * size + i] + r * hh[2 * size + i]);
