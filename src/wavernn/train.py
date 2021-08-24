@@ -46,9 +46,19 @@ BEST_CHECKPOINT: str = "best"
 @click.option(
     "--test-every", default=5000, help="How often to run validation during training"
 )
+@click.option(
+    "--initial-weights",
+    type=click.Path(exists=True, dir_okay=False),
+    help="Checkpoint to load as the initial weights",
+)
 @click.argument("overrides", nargs=-1)
 def train(  # pylint: disable=missing-param-doc
-    config: Optional[str], path: str, data: str, test_every: int, overrides: List[str]
+    config: Optional[str],
+    path: str,
+    data: str,
+    test_every: int,
+    initial_weights: Optional[str],
+    overrides: List[str],
 ) -> None:
     """
     Train a WaveRNN.
@@ -79,9 +89,12 @@ def train(  # pylint: disable=missing-param-doc
     data_module = AudioDataModule(data, model_config.data)
 
     last_path = os.path.join(path, CHECKPOINTS_DIR, "last.ckpt")
-    if os.path.exists(last_path):
+    if initial_weights is not None:
+        model = Model.load_from_checkpoint(initial_weights, config=model_config)
+        resume_from: Optional[str] = None
+    elif os.path.exists(last_path):
         model = Model.load_from_checkpoint(last_path, config=model_config)
-        resume_from: Optional[str] = last_path
+        resume_from = last_path
     else:
         # If this model has never been initialized before, compute the input
         # stats from the dataset. The input stats are used for normalizing the
