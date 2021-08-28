@@ -24,6 +24,31 @@ constexpr float QUANTIZATION_SCALE = 16384.0f;
 
 using torch::Tensor;
 
+namespace {
+
+float quantize_vector(int size, const float* const __restrict__ input,
+                      int16_t* const __restrict__ output) {
+  // Magnitude must be non-zero.
+  float maxMagnitude = 1.0e-3;
+#pragma omp simd
+  for (int i = 0; i < size; i++) {
+    float value = input[i];
+    float magnitude = value > 0 ? value : -value;
+    maxMagnitude = magnitude > maxMagnitude ? magnitude : maxMagnitude;
+  }
+
+  float fp32ToInt16 = QUANTIZATION_SCALE / maxMagnitude;
+  float int16ToFp32 = maxMagnitude / QUANTIZATION_SCALE;
+
+  for (int i = 0; i < size; i++) {
+    output[i] = int16_t(input[i] * fp32ToInt16);
+  }
+
+  return int16ToFp32;
+}
+
+}  // namespace
+
 namespace wavernn::fallback {
 
 void gemv(Tensor& out, const Tensor& bias, const Tensor& matrix,
@@ -150,6 +175,87 @@ void sparse_gemv(int output_size, float* const __restrict__ output,
   }
 }
 
+/**
+ * Compute a quantized block-sparse sparse matrix-vector multiply.
+ *
+ * @param output_size The number of output rows in this gemv.
+ * @param output Where to write the output (dense float32 vector).
+ * @param input Where to read the input data from (dense int16 vector).
+ * @param inputScale The scale the input was divided by to convert to int16.
+ * @param weights Packed weights.
+ * @param bias The bias vector (dense float32 vector).
+ * @param blocksPerRow Number of blocks involved in each row multiply.
+ * @param rowOffsets The offset in the weights for the nth row.
+ * @param indices The indices in the input vector to load blocks from.
+ * @param rowScales The scales the rows were divided by to convert to int16.
+ */
+void sparse_gemv_quantized(int output_size, float* const __restrict__ output,
+                           const int16_t* const __restrict__ input,
+                           float inputScale,
+                           const int16_t* const __restrict__ weights,
+                           const float* const __restrict__ bias,
+                           const int* const __restrict__ blocksPerRow,
+                           const int* const __restrict__ rowOffsets,
+                           const int* const __restrict__ indices,
+                           const float* const __restrict__ rowScales) {
+  // Parallelize the computation across the output row. Each thread can
+  // separately compute outputs for a block of the output vector.
+#pragma omp parallel for
+  for (int output_idx = 0; output_idx < output_size; output_idx++) {
+    // Number of block multiplications for this row.
+    int n_blocks = blocksPerRow[output_idx];
+
+    // Where the weights for this row start.
+    const int16_t* block_weights = weights + rowOffsets[output_idx];
+
+    // Where the input indices for this row start.
+    const int* block_indices =
+        indices + rowOffsets[output_idx] / QUANTIZED_BLOCK_SIZE;
+
+    // How much to scale final output by.
+    float outputScale = inputScale * rowScales[output_idx];
+
+    // Unroll the block multiplication loop by 4. This speeds up the gemvs by a
+    // little bit. If the number of blocks is not a multiple of 4, the follow-up
+    // loop will take care of it.
+    int block_idx = 0;
+    int n_blocks_grouped = n_blocks - (n_blocks % 4);
+    int32x4_t sum_vec_0 = vdupq_n_s32(0);
+    int32x4_t sum_vec_1 = sum_vec_0;
+    int32x4_t sum_vec_2 = sum_vec_0;
+    int32x4_t sum_vec_3 = sum_vec_0;
+    for (; block_idx < n_blocks_grouped; block_idx++) {
+      // Load the index of each block of the input.
+      int input_idx_0 = block_indices[block_idx + 0];
+
+      // Load the data for the 4 input blocks.
+      int16x4x4_t input_vec_0 = vld1q_s16_x4(input + input_idx_0);
+
+      // Load the data for the 4 weight blocks.
+      int16x4x4_t weight_vec_0 =
+          vld1q_s16_x4(block_weights + (block_idx + 0) * QUANTIZED_BLOCK_SIZE);
+
+      // Perform multiplications and accumulate into the accumulators.
+      sum_vec_0 = vmlal_s16(sum_vec_0, input_vec_0.val[0], weight_vec_0.val[0]);
+      sum_vec_1 = vmlal_s16(sum_vec_1, input_vec_0.val[1], weight_vec_0.val[1]);
+      sum_vec_2 = vmlal_s16(sum_vec_2, input_vec_0.val[2], weight_vec_0.val[2]);
+      sum_vec_3 = vmlal_s16(sum_vec_3, input_vec_0.val[3], weight_vec_0.val[3]);
+    }
+
+    // Sum up accumulators to get an accumulator for the follow-up loop.
+    int32x4_t sum_vec = vaddq_s32(vaddq_s32(sum_vec_0, sum_vec_1),
+                                  vaddq_s32(sum_vec_2, sum_vec_3));
+
+    float32x4_t float_vec = vcvtq_f32_s32(sum_vec);
+    float_vec = vmulq_f32(float_vec, vdupq_n_f32(outputScale));
+
+    // Compute the horizontal sum, add in the bias, and write to the output.
+    float32x2_t res = vadd_f32(vget_high_f32(sum_vec), vget_low_f32(sum_vec));
+    float sum = vget_lane_f32(vpadd_f32(res, res), 0);
+    output[output_idx] = bias[output_idx] + sum;
+  }
+}
+
 }  // namespace wavernn::neon
 
 #elif defined(__AVX512F__)
@@ -243,27 +349,6 @@ void sparse_gemv(int output_size, float* const __restrict__ output,
     // Compute the horizontal sum, add in the bias, and write to the output.
     output[output_idx] = bias[output_idx] + _mm512_reduce_add_ps(sum_vec);
   }
-}
-
-float quantize_vector(int size, const float* const __restrict__ input,
-                      int16_t* const __restrict__ output) {
-  // Magnitude must be non-zero.
-  float maxMagnitude = 1.0e-3;
-#pragma omp simd
-  for (int i = 0; i < size; i++) {
-    float value = input[i];
-    float magnitude = value > 0 ? value : -value;
-    maxMagnitude = magnitude > maxMagnitude ? magnitude : maxMagnitude;
-  }
-
-  float fp32ToInt16 = QUANTIZATION_SCALE / maxMagnitude;
-  float int16ToFp32 = maxMagnitude / QUANTIZATION_SCALE;
-
-  for (int i = 0; i < size; i++) {
-    output[i] = int16_t(input[i] * fp32ToInt16);
-  }
-
-  return int16ToFp32;
 }
 
 inline __m512i _mm512_loadu_epi16(const void* addr) {
@@ -502,27 +587,6 @@ void sparse_gemv(int output_size, float* const __restrict__ output,
   }
 }
 
-float quantize_vector(int size, const float* const __restrict__ input,
-                      int16_t* const __restrict__ output) {
-  // Magnitude must be non-zero.
-  float maxMagnitude = 1.0e-3;
-#pragma omp simd
-  for (int i = 0; i < size; i++) {
-    float value = input[i];
-    float magnitude = value > 0 ? value : -value;
-    maxMagnitude = magnitude > maxMagnitude ? magnitude : maxMagnitude;
-  }
-
-  float fp32ToInt16 = QUANTIZATION_SCALE / maxMagnitude;
-  float int16ToFp32 = maxMagnitude / QUANTIZATION_SCALE;
-
-  for (int i = 0; i < size; i++) {
-    output[i] = int16_t(input[i] * fp32ToInt16);
-  }
-
-  return int16ToFp32;
-}
-
 /**
  * Compute a quantized block-sparse sparse matrix-vector multiply.
  *
@@ -745,20 +809,19 @@ void PackedLinear::gemv(Tensor& out, const Tensor& vector) const {
     int16_t inputQuantized[input_size_];
 #endif
 
+    float inputScale = quantize_vector(input_size_, input, inputQuantized);
 #if defined(__AVX512F__)
-    float inputScale =
-        wavernn::avx512::quantize_vector(input_size_, input, inputQuantized);
     wavernn::avx512::sparse_gemv_quantized(
         output_size_, output, inputQuantized, inputScale, weights, bias,
         blocksPerRow, rowOffsets, indices, rowScales);
 #elif defined(__AVX2__)
-    float inputScale =
-        wavernn::avx2::quantize_vector(input_size_, input, inputQuantized);
     wavernn::avx2::sparse_gemv_quantized(
         output_size_, output, inputQuantized, inputScale, weights, bias,
         blocksPerRow, rowOffsets, indices, rowScales);
 #else
-    throw std::runtime_error("Quantized inference only supported with AVX");
+    wavernn::neon::sparse_gemv_quantized(
+        output_size_, output, inputQuantized, inputScale, weights, bias,
+        blocksPerRow, rowOffsets, indices, rowScales);
 #endif
   } else {
     float* const __restrict__ output = out.data_ptr<float>();
