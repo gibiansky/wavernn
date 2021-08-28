@@ -12,7 +12,7 @@ data:
     hop_length: 256
     win_length: 512
     log_epsilon: 1.0e-3
-    pre_emphasis: 0.0
+    pre_emphasis: 0.9
 
 conditioner:
   layers: 3
@@ -24,9 +24,9 @@ autoregressive:
   hidden_dimension: 1024
 
 prune:
-  final_sparsity: 0.8
-  start_iteration: 10000
-  stop_iteration: 400000
+  final_sparsity: 0.9
+  start_iteration: 200000
+  stop_iteration: 1000000
   block: [1, 32]
 
 output:
