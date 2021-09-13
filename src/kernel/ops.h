@@ -48,8 +48,8 @@ void UpdateGruState(const torch::Tensor &state, const torch::Tensor &ih,
  * first conditioner output.
  */
 void GruInput(const torch::Tensor &output,
-              const torch::Tensor &sampleEmbeddings,
-              const torch::Tensor &conditionerOutputs, int sample,
+              const std::vector<torch::Tensor> &sampleEmbeddings,
+              const torch::Tensor &conditionerOutputs, long *sample,
               int frameIndex);
 
 /**

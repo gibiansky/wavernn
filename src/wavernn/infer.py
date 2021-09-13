@@ -14,6 +14,7 @@ from tqdm import tqdm  # type: ignore
 
 from wavernn.dataset import AudioDataset
 from wavernn.model import Config, InferenceWaveRNN, Model
+from wavernn.pqmf import PQMF
 from wavernn.prune import PruneConfig, prune
 from wavernn.train import CHECKPOINTS_DIR, CONFIG_PATH
 from wavernn.util import die_if, load_extension_module
@@ -106,10 +107,28 @@ def infer_from_trained(path: str, input_file: str, output_file: str) -> None:
 
     # If necessary, apply de-emphasis (inverse of pre-emphasis) to the signal.
     waveform = np.concatenate(synthesized_clips)
-    if mel.pre_emphasis > 0:
-        waveform = librosa.effects.deemphasis(waveform, coef=mel.pre_emphasis)
-        waveform = np.clip(waveform, -0.9999, 0.9999)
 
+    if mel.pre_emphasis > 0:
+        if waveform.ndim == 1:
+            waveform = librosa.effects.deemphasis(waveform, coef=mel.pre_emphasis)
+        else:
+            for band in range(waveform.shape[1]):
+                waveform[:, band] = librosa.effects.deemphasis(
+                    waveform[:, band], coef=mel.pre_emphasis
+                )
+
+    multiband = model_config.data.multiband
+    if multiband.bands > 1:
+        pqmf = PQMF(
+            multiband.bands,
+            multiband.taps,
+            multiband.cutoff_ratio,
+            multiband.beta,
+        )
+        waveform = pqmf.synthesis(torch.from_numpy(waveform).t().unsqueeze(0))
+        waveform = waveform.flatten().numpy()
+
+    waveform = np.clip(waveform, -0.9999, 0.9999)
     soundfile.write(output_file, waveform, sample_rate)
 
 
@@ -176,7 +195,7 @@ def benchmark(  # pylint: disable=missing-param-doc
     # have near zero sparsity.
     weights = model.weights()
     sparse_matrices = [
-        weights.output_weight,
+        *weights.output_weights,
         weights.gru_weight_hh,
         weights.hidden_weight,
     ]

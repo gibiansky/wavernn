@@ -12,7 +12,13 @@ import torch
 from omegaconf import MISSING
 from torch import Tensor
 
-from wavernn.dataset import AudioDataset, AudioSample, DataConfig, MelConfig
+from wavernn.dataset import (
+    AudioDataset,
+    AudioSample,
+    DataConfig,
+    MelConfig,
+    MultibandConfig,
+)
 from wavernn.prune import PruneConfig, prune
 from wavernn.util import die_if, load_extension_module
 
@@ -200,6 +206,7 @@ class OutputConfig:
     # What type of input / output domain to use.
     # Allowed values:
     #   - "discretized-mu-law": Standard WaveRNN with one discretized prediction.
+    #   - "multiband-discretized-mu-law": WaveRNN with multiple bands.
     domain: str = "discretized-mu-law"
 
     # How many buckets to discretize audio sample into.
@@ -220,6 +227,7 @@ class DiscretizedMuLaw(torch.nn.Module):
 
         Args:
           config: Configuration for this input and output domain.
+          embedding_channels: How many channels to output for sample embeddings.
           input_channels: How many inputs are produced by the autoregressive network.
         """
         super().__init__()
@@ -293,7 +301,9 @@ class DiscretizedMuLaw(torch.nn.Module):
         Returns:
           Embedding of shape [batch, num_samples, embedding_channels].
         """
-        return self.embedding(self.quantize(waveform))
+        if torch.is_floating_point(waveform):
+            waveform = self.quantize(waveform)
+        return self.embedding(waveform)
 
     def sample(self, hidden: Tensor) -> Tensor:
         """
@@ -328,6 +338,96 @@ class DiscretizedMuLaw(torch.nn.Module):
         logits = self.linear(hidden).transpose(1, 2)
         quantized_targets = self.quantize(target)
         return torch.nn.functional.cross_entropy(logits, quantized_targets)
+
+
+class MultibandDiscretizedMuLaw(torch.nn.Module):
+    """A multiband discretized mu-law input and output domain."""
+
+    def __init__(
+        self,
+        config: OutputConfig,
+        bands: int,
+        embedding_channels: int,
+        input_channels: int,
+    ) -> None:
+        """
+        Create a new input and output domain.
+
+        Args:
+          config: Configuration for this input and output domain.
+          bands: Number of subbands for audio prediction.
+          embedding_channels: How many channels to output for sample embeddings.
+          input_channels: How many inputs are produced by the autoregressive network.
+        """
+        super().__init__()
+
+        assert config.domain == "discretized-mu-law", "Invalid domain type"
+
+        self.bands: torch.nn.ModuleList = torch.nn.ModuleList(
+            DiscretizedMuLaw(config, embedding_channels, input_channels)
+            for _ in range(bands)
+        )
+
+    def dequantize(self, waveform: Tensor) -> Tensor:
+        """Dequantize a waveform with mu-law encoding and quantization.
+
+        Args:
+          waveform: The int64 quantized waveform.
+
+        Returns:
+          A float32 tensor of the same shape was `waveform`.
+        """
+        return self.bands[0].dequantize(waveform)
+
+    def embed(self, waveform: Tensor) -> Tensor:
+        """
+        Create a waveform embedding tensor.
+
+        Args:
+          waveform: Input waveform of shape [batch, num_samples, num_bands].
+
+        Returns:
+          Embedding of shape [batch, num_samples, embedding_channels].
+        """
+        embeddings = [
+            band.embed(sub_waveform)
+            for band, sub_waveform in zip(self.bands, waveform.unbind(-1))
+        ]
+        return torch.stack(embeddings).sum(dim=0)
+
+    def sample(self, hidden: Tensor) -> Tensor:
+        """
+        Sample from this domain.
+
+        Args:
+          hidden: Output of the autoregressive layer of shape.
+
+        Returns:
+          Sample of shape [num_bands].
+        """
+        return torch.cat([band.sample(hidden) for band in self.bands])
+
+    def loss(self, hidden: Tensor, target: Tensor) -> Tensor:
+        """
+        Compute the final prediction outputs from the final hidden layer and
+        then compute loss against the target waveform.
+
+        The input activations and target waveform samples must be aligned; that
+        is, for an autoregressive network, the timesteps need to already be
+        shifted by one to make the network properly autoregressive.
+
+        Args:
+          hidden: Input activations of shape [batch, num_samples, input_channels].
+          target: Target waveform of shape [batch, num_samples, num_bands].
+
+        Returns:
+          The average loss of the prediction.
+        """
+        losses = [
+            band.loss(hidden, sub_target)
+            for band, sub_target in zip(self.bands, target.unbind(2))
+        ]
+        return torch.stack(losses).sum(dim=0)
 
 
 @dataclass
@@ -397,13 +497,13 @@ class ModelWeights(NamedTuple):
     hidden_bias: Tensor
 
     # Hidden-layer-to-output-logits weight matrix.
-    output_weight: Tensor
+    output_weights: List[Tensor]
 
     # Hidden-layer-to-output-logits bias vector.
-    output_bias: Tensor
+    output_biases: List[Tensor]
 
     # Sample embeddings matrix (one embedding row per quantization value).
-    sample_embeddings: Tensor
+    sample_embeddings: List[Tensor]
 
 
 class Model(pl.LightningModule):
@@ -422,16 +522,28 @@ class Model(pl.LightningModule):
         super().__init__()
         self.config = config
 
+        num_bands = config.data.multiband.bands
+        upsample_factor = config.data.mel.hop_length // num_bands
         self.conditioner = Conditioner(config.conditioner, config.data.mel.n_mels)
-        self.upsample = torch.nn.Upsample(scale_factor=config.data.mel.hop_length)
+        self.upsample = torch.nn.Upsample(scale_factor=upsample_factor)
         self.autoregressive = AutoregressiveRNN(
             config.autoregressive, config.conditioner.channels
         )
-        self.domain = DiscretizedMuLaw(
-            config.output,
-            config.conditioner.channels,
-            config.autoregressive.hidden_dimension,
-        )
+        if num_bands == 1:
+            self.domain: Union[
+                DiscretizedMuLaw, MultibandDiscretizedMuLaw
+            ] = DiscretizedMuLaw(
+                config.output,
+                config.conditioner.channels,
+                config.autoregressive.hidden_dimension,
+            )
+        else:
+            self.domain = MultibandDiscretizedMuLaw(
+                config.output,
+                num_bands,
+                config.conditioner.channels,
+                config.autoregressive.hidden_dimension,
+            )
 
     def configure_optimizers(self) -> torch.optim.Adam:
         """
@@ -517,7 +629,7 @@ class Model(pl.LightningModule):
         # This method is called by PyTorch Lightning.
         weights = self.weights()
         sparse_matrices = [
-            weights.output_weight,
+            *weights.output_weights,
             weights.gru_weight_hh,
             weights.hidden_weight,
         ]
@@ -543,6 +655,19 @@ class Model(pl.LightningModule):
         Returns:
           A ModelWeights tuple containing all the labeled model weights.
         """
+        if isinstance(self.domain, MultibandDiscretizedMuLaw):
+            sample_embeddings = [
+                domain.embedding.weight for domain in self.domain.bands
+            ]
+            output_weights = [domain.linear.weight for domain in self.domain.bands]
+            output_biases = [domain.linear.bias for domain in self.domain.bands]
+        elif isinstance(self.domain, DiscretizedMuLaw):
+            sample_embeddings = [self.domain.embedding.weight]
+            output_weights = [self.domain.linear.weight]
+            output_biases = [self.domain.linear.bias]
+        else:
+            raise ValueError("Unknown type for domain")
+
         return ModelWeights(
             gru_weight_ih=self.autoregressive.gru.weight_ih_l0,  # type: ignore
             gru_weight_hh=self.autoregressive.gru.weight_hh_l0,  # type: ignore
@@ -550,9 +675,9 @@ class Model(pl.LightningModule):
             gru_bias_hh=self.autoregressive.gru.bias_hh_l0,  # type: ignore
             hidden_weight=self.autoregressive.post_gru.weight,  # type: ignore
             hidden_bias=self.autoregressive.post_gru.bias,  # type: ignore
-            sample_embeddings=self.domain.embedding.weight,  # type: ignore
-            output_weight=self.domain.linear.weight,  # type: ignore
-            output_bias=self.domain.linear.bias,  # type: ignore
+            output_weights=output_weights,  # type: ignore
+            output_biases=output_biases,  # type: ignore
+            sample_embeddings=sample_embeddings,  # type: ignore
         )
 
     def loss(self, batch: AudioSample) -> Tensor:
@@ -571,7 +696,7 @@ class Model(pl.LightningModule):
         # padding_frames value, and we warn the user.
         num_frames = hidden.shape[2]
         num_samples = batch.waveform.shape[1]
-        hop_length = self.config.data.mel.hop_length
+        hop_length = self.config.data.mel.hop_length // self.config.data.multiband.bands
         die_if(
             num_frames * hop_length != num_samples,
             f"Number of frames ({num_frames}) in sample does not match "
@@ -607,7 +732,7 @@ class Model(pl.LightningModule):
         num_frames = 0
         frames = []
         for batch in data:
-            spectrogram = batch.spectrogram[:, padding_frames:-padding_frames]
+            spectrogram = batch.spectrogram[:, :, padding_frames:-padding_frames]
             spectrogram = spectrogram.transpose(1, 2).reshape((-1, n_mels))
             num_frames += spectrogram.shape[0]
             frames.append(spectrogram)
@@ -628,7 +753,7 @@ class Model(pl.LightningModule):
 
         Args:
           conditioning: The conditioning information of shape [num_frames, channels].
-          prev_sample: A tensor of shape [1] containing the last generated sample.
+          prev_sample: A tensor of shape [num_bands] containing the last generated sample.
           init_state: A tensor of shape [gru_dimension] containing the last state.
 
         Returns:
@@ -637,19 +762,19 @@ class Model(pl.LightningModule):
             - the final generated sample
             - the final GRU state
         """
-        hop_length = self.config.data.mel.hop_length
+        num_bands = self.config.data.multiband.bands
+        hop_length = self.config.data.mel.hop_length // num_bands
         num_frames = conditioning.size(0)
         num_samples = hop_length * num_frames
-        outputs = torch.zeros((num_samples,), dtype=torch.int64)
+        outputs = torch.zeros((num_samples, num_bands), dtype=torch.int64)
         state = init_state[None, None, :]
         for timestep in range(num_samples):
             frame_idx = timestep // hop_length
-            gru_input = conditioning[
-                frame_idx : frame_idx + 1, :
-            ] + self.domain.embedding(prev_sample)
+            sample_embedding = self.domain.embed(prev_sample)
+            gru_input = conditioning[frame_idx : frame_idx + 1, :] + sample_embedding
             hidden, state = self.autoregressive(gru_input.unsqueeze(0), state=state)
             prev_sample = self.domain.sample(hidden.flatten())
-            outputs[timestep] = prev_sample[0]
+            outputs[timestep] = prev_sample.reshape((num_bands,))
         return outputs, prev_sample, state.flatten()
 
     @torch.no_grad()
@@ -676,16 +801,18 @@ class Model(pl.LightningModule):
 
         # Extract hyperparameters and weights from the model.
         hop_length = self.config.data.mel.hop_length
+        num_bands = self.config.data.multiband.bands
         weights = self.weights()
 
         final_sample = torch.full(
-            (1,), (self.config.output.buckets - 1) // 2, dtype=torch.int64
+            (num_bands,), (self.config.output.buckets - 1) // 2, dtype=torch.int64
         )
         final_state = torch.zeros((self.config.autoregressive.gru_dimension))
 
-        sample_activations = torch.mm(
-            weights.sample_embeddings, weights.gru_weight_ih.t()
-        )
+        sample_activations = [
+            torch.mm(sample_embeddings, weights.gru_weight_ih.t())
+            for sample_embeddings in weights.sample_embeddings
+        ]
         for spectrogram in spectrograms:
             hidden = self.conditioner(spectrogram.unsqueeze(0))
             conditioning = hidden.squeeze(0).transpose(0, 1)
@@ -702,9 +829,9 @@ class Model(pl.LightningModule):
                     weights.gru_bias_hh,
                     weights.hidden_weight,
                     weights.hidden_bias,
-                    weights.output_weight,
-                    weights.output_bias,
-                    hop_length,
+                    weights.output_weights,
+                    weights.output_biases,
+                    hop_length // num_bands,
                     timing,
                 )
             else:
@@ -847,7 +974,7 @@ class InferenceWaveRNN:
             padding_frames=self.model.padding_frames,
             batch_size=1,
             mel=MelConfig(
-                sample_rate=self.model.sample_rate,
+                sample_rate=self.sample_rate,
                 n_fft=self.model.n_fft,
                 n_mels=self.model.n_mels,
                 fmin=self.model.fmin,
@@ -856,6 +983,12 @@ class InferenceWaveRNN:
                 win_length=self.model.win_length,
                 log_epsilon=self.model.log_epsilon,
                 pre_emphasis=self.model.pre_emphasis,
+            ),
+            multiband=MultibandConfig(
+                bands=self.model.multiband_bands,
+                taps=self.model.multiband_taps,
+                cutoff_ratio=self.model.multiband_cutoff_ratio,
+                beta=self.model.multiband_beta,
             ),
         )
 

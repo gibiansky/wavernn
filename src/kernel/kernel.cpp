@@ -18,10 +18,10 @@ Tensor wavernn_inference(
     const Tensor &gru_state,
 
     /* WaveRNN weights */
-    const Tensor &sample_embeddings, const Tensor &gru_weights_hh,
+    const std::vector<Tensor> &sample_embeddings, const Tensor &gru_weights_hh,
     const Tensor &gru_bias_hh, const Tensor &hidden_weights,
-    const Tensor &hidden_bias, const Tensor &output_weights,
-    const Tensor &output_bias,
+    const Tensor &hidden_bias, const std::vector<Tensor> &output_weights,
+    const std::vector<Tensor> &output_biases,
 
     /* WaveRNN hyperparameters */
     const int64_t hop_length, const bool timing) {
@@ -30,43 +30,56 @@ Tensor wavernn_inference(
   c10::InferenceMode inferenceMode;
 
   // Extract hyperparameters.
+  ASSERT_BOOL(!sample_embeddings.empty());
+  auto num_bands = (long)sample_embeddings.size();
   auto num_frames = gru_activations_ih.size(0);
   auto gru_state_size = gru_state.size(0);
   auto hidden_size = hidden_bias.size(0);
-  auto output_size = output_bias.size(0);
+  auto output_size = output_biases[0].size(0);
 
   // Verify sizes.
+  ASSERT_BOOL((int)sample_embeddings.size() == num_bands);
+  ASSERT_BOOL((int)output_weights.size() == num_bands);
+  ASSERT_BOOL((int)output_biases.size() == num_bands);
   ASSERT_TENSOR_SIZE(gru_activations_ih, num_frames, 3 * gru_state_size);
-  ASSERT_TENSOR_SIZE(previous_sample, 1);
+  ASSERT_TENSOR_SIZE(previous_sample, num_bands);
   ASSERT_TENSOR_SIZE(gru_state, gru_state_size);
-  ASSERT_TENSOR_SIZE(sample_embeddings, output_size, 3 * gru_state_size);
   ASSERT_TENSOR_SIZE(gru_weights_hh, 3 * gru_state_size, gru_state_size);
   ASSERT_TENSOR_SIZE(gru_bias_hh, 3 * gru_state_size);
   ASSERT_TENSOR_SIZE(hidden_weights, hidden_size, gru_state_size);
   ASSERT_TENSOR_SIZE(hidden_bias, hidden_size);
-  ASSERT_TENSOR_SIZE(output_weights, output_size, hidden_size);
-  ASSERT_TENSOR_SIZE(output_bias, output_size);
+
+  for (int i = 0; i < num_bands; i++) {
+    ASSERT_TENSOR_SIZE(sample_embeddings[i], output_size, 3 * gru_state_size);
+    ASSERT_TENSOR_SIZE(output_weights[i], output_size, hidden_size);
+    ASSERT_TENSOR_SIZE(output_biases[i], output_size);
+  }
 
   // Allocate temporary and output buffers.
   Tensor gru_input = torch::zeros(3 * gru_state_size);
   Tensor gru_activations_hh = torch::zeros(3 * gru_state_size);
   Tensor hidden = torch::zeros(hidden_size);
-  Tensor logits = torch::zeros(output_size);
-  Tensor outputs = torch::zeros(num_frames * hop_length,
-                                torch::TensorOptions().dtype(torch::kInt32));
-
-  auto prev_sample_a = previous_sample.accessor<long, 1>();
-  auto outputs_a = outputs.accessor<int, 1>();
+  Tensor output_tensor =
+      torch::zeros({num_frames * hop_length, num_bands},
+                   torch::TensorOptions().dtype(torch::kInt64));
+  auto outputs = output_tensor.accessor<long, 2>();
 
   PackedLinear gruMat(gru_weights_hh, gru_bias_hh);
   PackedLinear hiddenMat(hidden_weights, hidden_bias);
-  PackedLinear outputMat(output_weights, output_bias);
 
-  int sample = prev_sample_a[0];
+  std::vector<PackedLinear> outputMats;
+  std::vector<Tensor> logits;
+  for (auto i = 0; i < num_bands; i++) {
+    outputMats.emplace_back(output_weights[i], output_biases[i]);
+    logits.emplace_back(torch::zeros(output_size));
+  }
+
+  long *samples = previous_sample.data_ptr<long>();
+
   for (int timestep = 0; timestep < outputs.size(0); timestep++) {
     int frame_idx = timestep / int(hop_length);
     timer.start("GRU Input");
-    GruInput(gru_input, sample_embeddings, gru_activations_ih, sample,
+    GruInput(gru_input, sample_embeddings, gru_activations_ih, samples,
              frame_idx);
 
     timer.start("GRU GEMV");
@@ -82,17 +95,20 @@ Tensor wavernn_inference(
     ReLU(hidden);
 
     timer.start("Output GEMV");
-    outputMat.gemv(logits, hidden);
+    for (auto i = 0; i < num_bands; i++) {
+      outputMats[i].gemv(logits[i], hidden);
+    }
 
     timer.start("SampleSoftmax");
-    sample = SoftmaxSampleFromLogits(logits);
-    outputs_a[timestep] = sample;
+    for (auto i = 0; i < num_bands; i++) {
+      samples[i] = SoftmaxSampleFromLogits(logits[i]);
+      outputs[timestep][i] = samples[i];
+    }
   }
-  prev_sample_a[0] = sample;
 
   timer.print();
 
-  return outputs;
+  return output_tensor;
 }
 
 Tensor sparse_gemv(const Tensor &bias, const Tensor &matrix,

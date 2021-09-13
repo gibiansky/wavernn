@@ -383,46 +383,63 @@ void UpdateGruState(const torch::Tensor &gruState, const torch::Tensor &gruIh,
  * first conditioner output.
  */
 void GruInput(const torch::Tensor &output,
-              const torch::Tensor &sampleEmbeddings,
-              const torch::Tensor &conditionerOutputs, int sample,
+              const std::vector<torch::Tensor> &sampleEmbeddings,
+              const torch::Tensor &conditionerOutputs, long *samples,
               int frameIndex) {
   int size = output.size(0);
-  float *sampleEmbeddingsPtr =
-      sampleEmbeddings.data_ptr<float>() + sample * size;
+  int num_bands = (int)sampleEmbeddings.size();
+  std::vector<float *> sampleEmbeddingPtrs(sampleEmbeddings.size());
+  for (auto i = 0; i < num_bands; i++) {
+    sampleEmbeddingPtrs[i] =
+        sampleEmbeddings[i].data_ptr<float>() + samples[i] * size;
+  }
   float *conditionerOutputPtr =
       conditionerOutputs.data_ptr<float>() + frameIndex * size;
   float *outputPtr = output.data_ptr<float>();
 
   int i = 0;
-#if defined(__AVX2__)
-  int corrected = size - (size % 8);
-  for (; i < corrected; i += 8) {
-    auto a = _mm256_loadu_ps(sampleEmbeddingsPtr + i);
-    auto b = _mm256_loadu_ps(conditionerOutputPtr + i);
-    auto sum = _mm256_add_ps(a, b);
-    _mm256_storeu_ps(outputPtr + i, sum);
-  }
-#elif defined(__AVX512__)
+#if defined(__AVX512__)
   int corrected = size - (size % 16);
   for (; i < corrected; i += 16) {
-    auto a = _mm512_loadu_ps(sampleEmbeddingsPtr + i);
-    auto b = _mm512_loadu_ps(conditionerOutputPtr + i);
+    auto a = _mm512_loadu_ps(conditionerOutputPtr + i);
+    auto b = _mm512_loadu_ps(sampleEmbeddingPtrs[0] + i);
     auto sum = _mm512_add_ps(a, b);
+    for (int j = 1; j < num_bands; j++) {
+      sum = _mm512_add_ps(sum, _mm512_loadu_ps(sampleEmbeddingPtrs[j] + i));
+    }
     _mm512_storeu_ps(outputPtr + i, sum);
+  }
+#elif defined(__AVX2__)
+  int corrected = size - (size % 8);
+  for (; i < corrected; i += 8) {
+    auto a = _mm256_loadu_ps(conditionerOutputPtr + i);
+    auto b = _mm256_loadu_ps(sampleEmbeddingPtrs[0] + i);
+    auto sum = _mm256_add_ps(a, b);
+    for (int j = 1; j < num_bands; j++) {
+      sum = _mm256_add_ps(sum, _mm256_loadu_ps(sampleEmbeddingPtrs[j] + i));
+    }
+    _mm256_storeu_ps(outputPtr + i, sum);
   }
 #elif defined(__ARM_NEON)
   int corrected = size - (size % 4);
   for (; i < corrected; i += 4) {
-    auto a = vld1q_f32(sampleEmbeddingsPtr + i);
-    auto b = vld1q_f32(conditionerOutputPtr + i);
+    auto a = vld1q_f32(conditionerOutputPtr + i);
+    auto b = vld1q_f32(sampleEmbeddingPtr[0] + i);
     auto sum = vaddq_f32(a, b);
+    for (int j = 1; j < num_bands; j++) {
+      sum = vaddq_f32(sum, vld1q_f32(sampleEmbeddingPtrs[j] + i));
+    }
     vst1q_f32(outputPtr + i, sum);
   }
 #endif
 
   // Fallback or tail case.
   for (; i < size; i++) {
-    outputPtr[i] = sampleEmbeddingsPtr[i] + conditionerOutputPtr[i];
+    float sum = conditionerOutputPtr[i];
+    for (int j = 0; j < num_bands; j++) {
+      sum += sampleEmbeddingPtrs[j][i];
+    }
+    outputPtr[i] = sum;
   }
 }
 

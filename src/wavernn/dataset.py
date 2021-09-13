@@ -15,6 +15,7 @@ import pytorch_lightning as pl
 import torch
 from omegaconf import MISSING
 
+from wavernn.pqmf import PQMF
 from wavernn.util import cmd, die_if, download
 
 # Where to store dataset information. A valid dataset, as far as this package
@@ -372,6 +373,25 @@ class MelConfig:
 
 
 @dataclass
+class MultibandConfig:
+    """
+    Configuration for multi-band decomposition of training signal.
+    """
+
+    # How many bands to split into.
+    bands: int = MISSING
+
+    # Number of taps for the filter.
+    taps: int = MISSING
+
+    # The cutoff ratio hyperparameter for prototype filter design.
+    cutoff_ratio: float = MISSING
+
+    # Beta parameter for the Kaiser window.
+    beta: float = MISSING
+
+
+@dataclass
 class DataConfig:
     """
     Configuration for a training dataset.
@@ -379,6 +399,9 @@ class DataConfig:
 
     # Configuration for mel spectrogram extraction.
     mel: MelConfig = MISSING
+
+    # Configuration for subband filtering.
+    multiband: MultibandConfig = MISSING
 
     # How many spectrogram frames to include in each audio sample.
     # The number of audio samples is clip_frames * mel.hop_length.
@@ -402,8 +425,12 @@ class AudioSample(NamedTuple):
     A training sample or a batch of training samples.
     """
 
-    # A float32 waveform tensor of shape [num_samples].
+    # If only one subband, a float32 waveform tensor of shape [num_samples].
     # After batching, the shape will be [batch_size, num_samples].
+    #
+    # If subband modeling is enabled via multiband.bands > 1, then this will
+    # instead of a float32 waveform tensor of shape [num_samples, num_bands].
+    # After batching, the whape will be [batch_size, num_samples, num_bands].
     waveform: torch.Tensor
 
     # A float32 mel spectrogram tensor of shape [n_mels, num_frames].
@@ -433,6 +460,12 @@ class AudioDataset(torch.utils.data.IterableDataset):
 
         self.config = config
         self.shuffle = shuffle
+        self.pqmf = PQMF(
+            config.multiband.bands,
+            config.multiband.taps,
+            config.multiband.cutoff_ratio,
+            config.multiband.beta,
+        )
 
         # Collect all files in this dataset.
         self.filenames: List[str] = []
@@ -486,6 +519,7 @@ class AudioDataset(torch.utils.data.IterableDataset):
           in each sample.
         """
         mel = self.config.mel
+        multiband = self.config.multiband
         if clip_frames is None:
             clip_frames = self.config.clip_frames
 
@@ -494,7 +528,11 @@ class AudioDataset(torch.utils.data.IterableDataset):
         sr: int
         raw_waveform, sr = librosa.load(filename, sr=mel.sample_rate)
 
-        if mel.pre_emphasis > 0:
+        # Apply pre-emphasis on the raw data only if we aren't going to
+        # decompose it into multiple subbands as well. If we *do* want to
+        # decompose it, the pre-emphasis should be applied on the filtered
+        # signal.
+        if multiband.bands == 1 and mel.pre_emphasis > 0:
             raw_waveform = librosa.effects.preemphasis(
                 raw_waveform, coef=mel.pre_emphasis
             )
@@ -546,6 +584,30 @@ class AudioDataset(torch.utils.data.IterableDataset):
         torch_spectrogram = torch.from_numpy(spectrogram)
         log_spectrogram = torch.log(torch.maximum(torch_spectrogram, log_epsilon))
 
+        # Now that we have computed the spectrogram on the fullband signal,
+        # apply subband decomposition to generate the audio signal.
+        if multiband.bands == 1:
+            band_hop_length = mel.hop_length
+        else:
+            assert (
+                mel.hop_length % multiband.bands == 0
+            ), "# of bands must divide mel hop length"
+            band_hop_length = mel.hop_length // multiband.bands
+            torch_waveform = torch.from_numpy(padded_waveform.reshape((1, 1, -1)))
+            analyzed = self.pqmf.analysis(torch_waveform).reshape((multiband.bands, -1))
+            padded_waveform = analyzed.t().numpy()
+
+            # Apply pre-emphasis to each band.
+            if mel.pre_emphasis > 0:
+                for b in range(multiband.bands):
+                    padded_waveform[:, b] = librosa.effects.preemphasis(
+                        padded_waveform[:, b], coef=mel.pre_emphasis
+                    )
+
+            # Ensure that after subband filtering and pre-emphasis, everything
+            # is in a reasonable audio range.
+            padded_waveform = np.clip(padded_waveform, -0.9999999, 0.9999999)
+
         # Split the audio and spectrogram into chunks. Each chunk has
         # 'clip_frames' spectrogram frames and the corresponding samples.
         # Additionally, 'padding_frames' spectrogram frames are included on the
@@ -557,9 +619,11 @@ class AudioDataset(torch.utils.data.IterableDataset):
             if clip_spectrogram.shape[1] != desired_frames:
                 continue
 
-            start_sample = (i + padding_frames) * mel.hop_length
-            end_sample = start_sample + clip_frames * mel.hop_length
+            start_sample = (i + padding_frames) * band_hop_length
+            end_sample = start_sample + clip_frames * band_hop_length
             clip_waveform = torch.from_numpy(padded_waveform[start_sample:end_sample])
+            if clip_waveform.shape[0] != clip_frames * band_hop_length:
+                continue
             yield AudioSample(waveform=clip_waveform, spectrogram=clip_spectrogram)
 
 
