@@ -1,8 +1,13 @@
-# Config for multiband WaveRNN.
+# Config for LPCnet-style WaveRNN.
 data:
-  clip_frames: 9
+  clip_frames: 3
   padding_frames: 6
   batch_size: 64
+  lpc:
+    order: 16
+    hop_length: 256
+    win_length: 512
+    griffinlim_iterations: 10
   mel:
     sample_rate: 22050
     n_fft: 1024
@@ -12,10 +17,9 @@ data:
     hop_length: 256
     win_length: 512
     log_epsilon: 1.0e-3
-    pre_emphasis: 0.5
-
+    pre_emphasis: 0.9
   multiband:
-    bands: 4
+    bands: 1
     taps: 62
     cutoff_ratio: 0.142
     beta: 9.0
@@ -32,7 +36,7 @@ autoregressive:
 prune:
   final_sparsity: 0.0
   start_iteration: 200000
-  stop_iteration: 2000000
+  stop_iteration: 1000000
   block: [1, 32]
 
 output:
@@ -42,4 +46,4 @@ output:
 optimizer:
   learning_rate: 2.0e-4
   decay_rate: 0.1
-  decay_iterations: [4000000, 4300000]
+  decay_iterations: [2000000, 2500000]

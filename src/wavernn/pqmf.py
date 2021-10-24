@@ -58,7 +58,9 @@ class PQMF(torch.nn.Module):
 
     """
 
-    def __init__(self, subbands=4, taps=62, cutoff_ratio=0.142, beta=9.0):
+    def __init__(
+        self, subbands: int, taps: int, cutoff_ratio: float, beta: float
+    ) -> None:
         """Initilize PQMF module.
 
         The cutoff_ratio and beta parameters are optimized for #subbands = 4.

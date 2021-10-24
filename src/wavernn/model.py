@@ -3,7 +3,17 @@ WaveRNN model definition.
 """
 import os
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator, List, NamedTuple, Optional, Tuple, Union
+from typing import (
+    Any,
+    Iterable,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import pytorch_lightning as pl
@@ -216,17 +226,77 @@ class OutputConfig:
     mu: float = MISSING
 
 
+class AudioDomain(Protocol):
+    """
+    An audio domain protocol.
+    """
+
+    def embed(self, inputs: Tensor, prediction: Tensor) -> Tensor:
+        """
+        Embeds the audio to a hidden representation.
+
+        Args:
+          inputs: Input from the waveform.
+          prediction: If using linear prediction, the linear prediction signal.
+            If not using linear prediction, a tensor of zeros.
+
+        Returns:
+          The neural embedding of the input.
+        """
+
+    def loss(self, hidden: Tensor, waveform: Tensor) -> Tensor:
+        """
+        Apply final layer and compute loss.
+
+        Args:
+          hidden: Output of the autoregressive RNN.
+          waveform: Ground truth waveform value.
+
+        Returns:
+          The computed scalar loss.
+        """
+
+    def sample(self, hidden: Tensor) -> Tensor:
+        """
+        Apply final layer and sample values.
+
+        Args:
+          hidden: Output of the autoregressive RNN.
+
+        Returns:
+          The sampled audio values.
+        """
+
+    def dequantize(self, quantized: Tensor) -> Tensor:
+        """
+        Convert quantized values to continuous values.
+
+        If values are already continuous, does nothing.
+
+        Args:
+          quantized: Tensor of quantized audio values.
+
+        Returns:
+          A float32 audio tensor.
+        """
+
+
 class DiscretizedMuLaw(torch.nn.Module):
     """A discretized mu-law input and output domain."""
 
     def __init__(
-        self, config: OutputConfig, embedding_channels: int, input_channels: int
+        self,
+        config: OutputConfig,
+        predictions: bool,
+        embedding_channels: int,
+        input_channels: int,
     ) -> None:
         """
         Create a new input and output domain.
 
         Args:
           config: Configuration for this input and output domain.
+          predictions: Whether to use LPC predictions.
           embedding_channels: How many channels to output for sample embeddings.
           input_channels: How many inputs are produced by the autoregressive network.
         """
@@ -238,6 +308,9 @@ class DiscretizedMuLaw(torch.nn.Module):
         self.buckets: int = config.buckets
         self.embedding: torch.nn.Module = torch.nn.Embedding(
             self.buckets, embedding_channels
+        )
+        self.prediction_embedding: Optional[torch.nn.Module] = (
+            torch.nn.Linear(1, embedding_channels) if predictions else None
         )
         self.linear: torch.nn.Module = torch.nn.Linear(input_channels, self.buckets)
 
@@ -291,19 +364,24 @@ class DiscretizedMuLaw(torch.nn.Module):
         x = torch.sign(x) * (torch.exp(torch.abs(x) * torch.log1p(mu)) - 1.0) / mu
         return x
 
-    def embed(self, waveform: Tensor) -> Tensor:
+    def embed(self, waveform: Tensor, prediction: Tensor) -> Tensor:
         """
         Create a waveform embedding tensor.
 
         Args:
           waveform: Input waveform of shape [batch, num_samples].
+          prediction: Input prediction of shape [batch, num_samples].
 
         Returns:
           Embedding of shape [batch, num_samples, embedding_channels].
         """
         if torch.is_floating_point(waveform):
             waveform = self.quantize(waveform)
-        return self.embedding(waveform)
+
+        embedding = self.embedding(waveform)
+        if self.prediction_embedding is not None:
+            embedding += self.prediction_embedding(prediction.unsqueeze(-1))
+        return embedding
 
     def sample(self, hidden: Tensor) -> Tensor:
         """
@@ -346,6 +424,7 @@ class MultibandDiscretizedMuLaw(torch.nn.Module):
     def __init__(
         self,
         config: OutputConfig,
+        predictions: bool,
         bands: int,
         embedding_channels: int,
         input_channels: int,
@@ -355,6 +434,7 @@ class MultibandDiscretizedMuLaw(torch.nn.Module):
 
         Args:
           config: Configuration for this input and output domain.
+          predictions: Whether to use LPC predictions.
           bands: Number of subbands for audio prediction.
           embedding_channels: How many channels to output for sample embeddings.
           input_channels: How many inputs are produced by the autoregressive network.
@@ -364,7 +444,7 @@ class MultibandDiscretizedMuLaw(torch.nn.Module):
         assert config.domain == "discretized-mu-law", "Invalid domain type"
 
         self.bands: torch.nn.ModuleList = torch.nn.ModuleList(
-            DiscretizedMuLaw(config, embedding_channels, input_channels)
+            DiscretizedMuLaw(config, predictions, embedding_channels, input_channels)
             for _ in range(bands)
         )
 
@@ -379,19 +459,22 @@ class MultibandDiscretizedMuLaw(torch.nn.Module):
         """
         return self.bands[0].dequantize(waveform)
 
-    def embed(self, waveform: Tensor) -> Tensor:
+    def embed(self, waveform: Tensor, prediction: Tensor) -> Tensor:
         """
         Create a waveform embedding tensor.
 
         Args:
           waveform: Input waveform of shape [batch, num_samples, num_bands].
+          prediction: Input prediction of shape [batch, num_samples, num_bands].
 
         Returns:
           Embedding of shape [batch, num_samples, embedding_channels].
         """
         embeddings = [
-            band.embed(sub_waveform)
-            for band, sub_waveform in zip(self.bands, waveform.unbind(-1))
+            band.embed(sub_waveform, sub_prediction)
+            for band, sub_waveform, sub_prediction in zip(
+                self.bands, waveform.unbind(-1), prediction.unbind(1)
+            )
         ]
         return torch.stack(embeddings).sum(dim=0)
 
@@ -529,17 +612,19 @@ class Model(pl.LightningModule):
         self.autoregressive = AutoregressiveRNN(
             config.autoregressive, config.conditioner.channels
         )
+
+        is_lpc = config.data.lpc.order > 0
         if num_bands == 1:
-            self.domain: Union[
-                DiscretizedMuLaw, MultibandDiscretizedMuLaw
-            ] = DiscretizedMuLaw(
+            self.domain: AudioDomain = DiscretizedMuLaw(
                 config.output,
+                is_lpc,
                 config.conditioner.channels,
                 config.autoregressive.hidden_dimension,
             )
         else:
             self.domain = MultibandDiscretizedMuLaw(
                 config.output,
+                is_lpc,
                 num_bands,
                 config.conditioner.channels,
                 config.autoregressive.hidden_dimension,
@@ -654,6 +739,9 @@ class Model(pl.LightningModule):
 
         Returns:
           A ModelWeights tuple containing all the labeled model weights.
+
+        Raises:
+          ValueError: If we are using an unknown audio domain.
         """
         if isinstance(self.domain, MultibandDiscretizedMuLaw):
             sample_embeddings = [
@@ -706,7 +794,7 @@ class Model(pl.LightningModule):
 
         # Run the autoregressive chunk of the network.
         hidden = self.upsample(hidden).transpose(1, 2)
-        hidden += self.domain.embed(batch.waveform)
+        hidden += self.domain.embed(batch.waveform, batch.prediction)
         predictions, _ = self.autoregressive(hidden)
 
         return self.domain.loss(predictions[:, :-1, :], batch.waveform[:, 1:])
@@ -867,14 +955,14 @@ class ExportableWaveRNN(torch.nn.Module):
 
         # Create the weights needed for autoregressive inference.
         self.sample_activations = torch.mm(
-            weights.sample_embeddings, weights.gru_weight_ih.t()
+            weights.sample_embeddings, weights.gru_weight_ih.t()  # type: ignore
         )
         self.gru_weight_hh = weights.gru_weight_hh
         self.gru_bias_hh = weights.gru_bias_hh
         self.hidden_weight = weights.hidden_weight
         self.hidden_bias = weights.hidden_bias
-        self.output_weight = weights.output_weight
-        self.output_bias = weights.output_bias
+        self.output_weight = weights.output_weight  # type: ignore
+        self.output_bias = weights.output_bias  # type: ignore
         self.hop_length = config.data.mel.hop_length
         self.gru_bias_ih = weights.gru_bias_ih
         self.gru_weight_ih_t = weights.gru_weight_ih.t()

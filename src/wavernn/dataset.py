@@ -15,6 +15,7 @@ import pytorch_lightning as pl
 import torch
 from omegaconf import MISSING
 
+from wavernn.lpc import LPC, LinearPredictionConfig, MelConfig
 from wavernn.pqmf import PQMF
 from wavernn.util import cmd, die_if, download
 
@@ -320,59 +321,6 @@ def cmd_list() -> None:
 
 
 @dataclass
-class MelConfig:
-    """Configuration for log mel spectrogram extraction."""
-
-    # Sample rate of the audio. If the audio is not this sample rate, it will
-    # be up- or downsampled to this sample rate when it is loaded.
-    sample_rate: int = MISSING
-
-    # Number of Fourier coefficients in the spectrogram. This must be greater
-    # than or equal to the window size specified by win_length.
-    n_fft: int = MISSING
-
-    # Number of bands in the mel spectrogram.
-    n_mels: int = MISSING
-
-    # Minimum frequency to include in the mel spectrogram.
-    # A reasonable value is 0 to include all frequencies in the audio.
-    fmin: float = MISSING
-
-    # Maximum frequency to include in the mel spectrogram.
-    # A reasonable value is sample_rate / 2 to include all frequencies in the audio.
-    fmax: float = MISSING
-
-    # How many samples to shift between each consecutive frame. This must be
-    # smaller than the window size specified by win_length. A reasonable value
-    # is 5 - 25 milliseconds, that is, sample_rate * 0.005 or sample_rate * 0.025.
-    hop_length: int = MISSING
-
-    # How many samples to include in the window used for STFT extraction. This
-    # must be greater than hop_length and a reasonable value is 2x or 4x hop_length.
-    win_length: int = MISSING
-
-    # Minimum spectrogram magnitude to enforce to avoid log underflow.
-    # Log mel spectrogram is ln(clip(mel_spectrogram, log_epsilon)).
-    # If a minimum value isn't enforced, then low-volume regions with a value
-    # of zero will become negative infinity.
-    log_epsilon: float = MISSING
-
-    # Coefficient for a pre-emphasis filter to apply to the waveform prior to feature extraction.
-    # A pre-emphasis filter replaces the signal x[t] with the modified signal x'[t]
-    #
-    #     x'[t] = x[t] - alpha * x[t - 1]
-    #
-    # Setting the coefficient value here to zero removes this filter. Setting
-    # it to a higher value (commonly 0.97, for instance) effectively boosts
-    # high frequencies in the training data. A de-emphasis (inverse of
-    # pre-emphasis) filter is applied to the synthesized data, which in turn
-    # attenuates high frequencies. Quantization noise is more audible in higher
-    # frequencies and thus pre-emphasis can reduce the audible impact of
-    # quantization noise.
-    pre_emphasis: float = MISSING
-
-
-@dataclass
 class MultibandConfig:
     """
     Configuration for multi-band decomposition of training signal.
@@ -403,6 +351,9 @@ class DataConfig:
     # Configuration for subband filtering.
     multiband: MultibandConfig = MISSING
 
+    # Configuration for linear prediction.
+    lpc: LinearPredictionConfig = MISSING
+
     # How many spectrogram frames to include in each audio sample.
     # The number of audio samples is clip_frames * mel.hop_length.
     clip_frames: int = MISSING
@@ -430,8 +381,22 @@ class AudioSample(NamedTuple):
     #
     # If subband modeling is enabled via multiband.bands > 1, then this will
     # instead of a float32 waveform tensor of shape [num_samples, num_bands].
-    # After batching, the whape will be [batch_size, num_samples, num_bands].
+    # After batching, the shape will be [batch_size, num_samples, num_bands].
+    #
+    # If linear prediction is enabled via lpc > 0, then this will be the
+    # excitation signal. The linear prediction will be in 'prediction'.
     waveform: torch.Tensor
+
+    # If linear prediction is enabled via lpc > 0, a float32 tensor containing
+    # the linearly predicted waveform of shape [num_samples].
+    # After batching, the shape will be [batch_size, num_samples].
+    #
+    # If multiband modeling is enabled via multiband.bands > 1, then this will
+    # instead of a float32 waveform tensor of shape [num_samples, num_bands].
+    # After batching, the shape will be [batch_size, num_samples, num_bands].
+    #
+    # If linear prediction is disabled, this will be a float32 tensor of zeros.
+    prediction: torch.Tensor
 
     # A float32 mel spectrogram tensor of shape [n_mels, num_frames].
     # After batching, the shape will be [batch_size, n_mels, num_frames].
@@ -466,6 +431,7 @@ class AudioDataset(torch.utils.data.IterableDataset):
             config.multiband.cutoff_ratio,
             config.multiband.beta,
         )
+        self.lpc = LPC(config.lpc, config.mel, self.pqmf)
 
         # Collect all files in this dataset.
         self.filenames: List[str] = []
@@ -582,7 +548,7 @@ class AudioDataset(torch.utils.data.IterableDataset):
         # Compute the log mel spectrogram with a minimum value to avoid underflow.
         log_epsilon = torch.tensor(mel.log_epsilon, dtype=torch.float32)
         torch_spectrogram = torch.from_numpy(spectrogram)
-        log_spectrogram = torch.log(torch.maximum(torch_spectrogram, log_epsilon))
+        log_spectrogram = torch.log(torch_spectrogram + log_epsilon)
 
         # Now that we have computed the spectrogram on the fullband signal,
         # apply subband decomposition to generate the audio signal.
@@ -608,6 +574,16 @@ class AudioDataset(torch.utils.data.IterableDataset):
             # is in a reasonable audio range.
             padded_waveform = np.clip(padded_waveform, -0.9999999, 0.9999999)
 
+        if self.config.lpc == 0:
+            padded_prediction = np.zeros_like(padded_waveform)
+        else:
+            padded_prediction = self.lpc.estimate(
+                log_spectrogram.numpy(), padded_waveform
+            )
+            padded_waveform = np.clip(
+                padded_waveform - padded_prediction, -0.9999999, 0.9999999
+            )
+
         # Split the audio and spectrogram into chunks. Each chunk has
         # 'clip_frames' spectrogram frames and the corresponding samples.
         # Additionally, 'padding_frames' spectrogram frames are included on the
@@ -622,9 +598,16 @@ class AudioDataset(torch.utils.data.IterableDataset):
             start_sample = (i + padding_frames) * band_hop_length
             end_sample = start_sample + clip_frames * band_hop_length
             clip_waveform = torch.from_numpy(padded_waveform[start_sample:end_sample])
+            clip_prediction = torch.from_numpy(
+                padded_prediction[start_sample:end_sample]
+            )
             if clip_waveform.shape[0] != clip_frames * band_hop_length:
                 continue
-            yield AudioSample(waveform=clip_waveform, spectrogram=clip_spectrogram)
+            yield AudioSample(
+                waveform=clip_waveform,
+                spectrogram=clip_spectrogram,
+                prediction=clip_prediction,
+            )
 
 
 class AudioDataModule(pl.LightningDataModule):
